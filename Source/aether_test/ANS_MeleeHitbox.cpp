@@ -108,6 +108,8 @@ void UANS_MeleeHitbox::NotifyTick(USkeletalMeshComponent* MeshComp, UAnimSequenc
 		{
 			continue;
 		}
+		Attacker->PlayCombatCameraShake(CameraShakeScale);
+		Victim->PlayCombatCameraShake(CameraShakeScale);
 		if (bOnlyHitPlayers)
 		{
 			Attacker->StartMeleeDamageCooldown(AttackCooldown);

@@ -11,6 +11,7 @@ class UGameplayAbility;
 class UGameplayEffect;
 class UAnimMontage;
 class UAnimSequenceBase;
+class UCameraShakeBase;
 class UCombatPlayerHUDWidget;
 class ACombatCharacterBase;
 struct FOnAttributeChangeData;
@@ -104,6 +105,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|Reaction")
 	void ApplyCombatKnockback(FVector Direction, float HorizontalStrength, float LiftZ = 0.f);
 
+	/** Play the native hit shake only for a local player camera. */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Camera")
+	void PlayCombatCameraShake(float Scale = 1.f);
+
 	/** BP callback de them VFX/camera shake sau khi phan ung hit mac dinh da chay. */
 	UFUNCTION(BlueprintImplementableEvent, Category = "GAS")
 	void OnMeleeHitReceived(ACombatCharacterBase* Attacker);
@@ -182,6 +187,7 @@ protected:
 	void ResetCombo();
 	void CreatePlayerHUDIfNeeded();
 	void UpdateCombatFacing(float DeltaSeconds);
+	void UpdateCombatCamera(float DeltaSeconds);
 	ACombatCharacterBase* FindNearestCombatTarget() const;
 
 	/** Keeps an optional world-space/screen-space HPBar widget in sync with GAS. */
@@ -224,6 +230,33 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Combat|Targeting", meta = (ClampMin = "1.0"))
 	float AutoFaceTurnSpeed = 14.f;
 
+	/** Uses the existing Blueprint spring arm/camera; no replacement camera component is created. */
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera")
+	bool bCombatCameraEnabled = true;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "0.0"))
+	float CombatCameraArmLength = 520.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "1.0"))
+	float CombatCameraInterpSpeed = 7.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "1.0", ClampMax = "179.0"))
+	float CombatCameraFOV = 86.f;
+
+	/** Raises the camera's look/tracing point above the capsule center so combat frames the torso instead of the hips. */
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "-200.0", ClampMax = "200.0"))
+	float CombatCameraTargetOffsetZ = 40.f;
+
+	/** SpringArm follow damping used to keep jumps, root motion, and fast turns from being copied 1:1 into the camera. */
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "1.0"))
+	float CombatCameraLagSpeed = 8.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "1.0"))
+	float CombatCameraRotationLagSpeed = 10.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "0.0"))
+	float CombatCameraLagMaxDistance = 90.f;
+
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "Combat|Targeting")
 	TObjectPtr<ACombatCharacterBase> CurrentCombatTarget;
 
@@ -232,6 +265,18 @@ protected:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UCombatPlayerHUDWidget> PlayerHUD;
+
+	UPROPERTY(Transient)
+	float DefaultCameraArmLength = 0.f;
+
+	UPROPERTY(Transient)
+	float DefaultCameraFOV = 90.f;
+
+	UPROPERTY(Transient)
+	bool bCameraDefaultsCaptured = false;
+
+	UPROPERTY(Transient)
+	bool bCameraFollowTuningApplied = false;
 
 	FTimerHandle ComboResetTimer;
 

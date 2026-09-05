@@ -217,3 +217,57 @@ That separation would allow a designer-facing “9-step chain” display while r
 The implementation pass preceding this audit was built for both game and editor targets on UE 5.4.4. PIE traces verified that enemy damage begins at the authored attack contact window rather than on capsule contact, and that the player E path reaches cleanup instead of remaining permanently attacking when a stamina window fails.
 
 This document records the source-level combo audit and the expected interpretation of the observed `COMBO x21`. No combat code, Blueprint graph, montage timing, or HUD behavior was changed to produce this documentation.
+
+## 12. Planned VFX trigger contract
+
+The imported `Easy_Impact_Frames` pack is currently content only; no montage notify or gameplay wiring has been added yet. The pack is mounted under `/Game/Vefects/Easy_Impact_Frames` and contains 200 `.uasset` files, including Niagara systems in `VFX/Frames/Particles`, their materials/textures, demo maps, a demo character, and helper Blueprints. The first candidate to preview is `NS_Impact_Frame_01`; the `Always`, `Static`, `Distortion`, and `Advanced` variants should remain explicit designer choices rather than being auto-selected by combat code.
+
+Use two separate notify lanes:
+
+```text
+Montage notify track
+├─ Timed Niagara notify/state
+│  └─ slash, arc, trail, dust: spawn at an authored socket and play on every attack
+└─ ANS_MeleeHitbox with optional ImpactVFX
+   └─ trace → ApplyDamageToTarget == true → spawn impact at Hit.ImpactPoint
+```
+
+### Author-time effects
+
+Slash streaks, weapon trails, anticipation flashes, and ground dust that describe the action belong directly on the montage timeline. A `UAnimNotifyState_TimedNiagaraEffect`-style notify is appropriate for an effect that follows a socket for the notify duration; a one-shot `UAnimNotify_PlayNiagaraEffect`-style notify is appropriate for a burst that owns its own finite Niagara lifetime. These effects must not be made dependent on whether the hitbox finds a target.
+
+### Confirmed-hit effects
+
+An impact frame is not an unconditional one-shot notify, because it would play on a whiff. The planned integration is an optional `UNiagaraSystem* ImpactVFX` on `UANS_MeleeHitbox`. After the existing `ApplyDamageToTarget()` gate returns `true`, the notify spawns the system at the confirmed `FHitResult` impact point, oriented from the hit normal; if the trace does not provide a useful point, fall back to the victim's capsule/mesh location. The spawn occurs once per victim per active hitbox window because `HitActors` already owns that dedupe. A miss, dead target, rejected damage, or invulnerable target produces no impact frame, poison, launch, or hit-confirm VFX.
+
+This keeps visual timing on the animation while keeping truth in gameplay: the notify says *when an attack can connect*, and the hit resolver says *whether it actually connected*. Impact systems should be finite/auto-deactivating; infinite systems belong to a separate stateful effect with an explicit cleanup path.
+
+## 13. E4/S7 finisher cinematic — analysis only
+
+The final E attack is `S7` in the current `[S4, S5, S6, S7]` skill lane. The cinematic should begin only after the S7 hit window confirms at least one real victim. A whiff must finish as an ordinary attack: no time dilation, orbit, impact frame, or finisher camera shake.
+
+Proposed sequence:
+
+1. Keep the S7 `ANS_MeleeHitbox` as the sole damage authority and guard the cinematic with one `bFinisherCinematicStarted` flag per montage activation.
+2. On the first confirmed hit, snapshot nearby living enemies inside a bounded radius. Temporarily slow only those enemies through a tracked per-actor time-dilation/paused-combat state; avoid global time dilation in the first pass so input, HUD, and the player camera remain responsive.
+3. Enter a dedicated finisher camera mode. Save the normal SpringArm/control-rotation state, drive a short orbit around the player with eased yaw and fixed torso-height framing, then blend back before restoring normal combat camera ownership. The regular `UpdateCombatCamera()` must not fight the scripted orbit.
+4. Layer the effects by truth: authored slash/charge effects on the timeline, confirmed impact frame at each valid victim, and a separate floor-traced stomp ring at the landing point. Apply the largest shake/FOV punch only after confirmation and keep it short so it does not compete with the orbit.
+5. On montage completion, interruption, death, or actor destruction, restore enemy time dilation, camera ownership, control rotation, and any finisher flag exactly once.
+
+The first QA pass should use one enemy and a debug orbit before adding multi-enemy slow motion. Acceptance is: whiff has no cinematic, one confirmed hit starts one orbit, multiple victims do not restart it, enemies outside the radius remain normal, and every interruption leaves no slow-motion or camera state behind.
+
+## 14. Perfect dodge — analysis only
+
+The existing Phase 5 plan describes a normal dodge with movement plus a broad invulnerability window. Perfect dodge is a narrower result inside that dodge, not a second input: an enemy hitbox must actually reach the player during the perfect sub-window. Merely pressing dodge near an enemy is not enough.
+
+Use three conceptual results in the incoming-hit resolver:
+
+```text
+Outside dodge i-frames  → apply damage/reaction normally
+Inside normal i-frames  → reject damage silently
+Inside perfect window   → reject damage + emit one PerfectDodge event
+```
+
+`UANS_MeleeHitbox` is the correct source of contact because it already performs the authored socket sweep and owns per-window dedupe. It should ask the victim's native dodge state to resolve the hit before applying damage; the perfect-dodge response can then trigger a short counter opportunity, small camera cue, and optional time pulse without allowing damage, poison, launch, or hit reaction through. Consume the perfect response once per dodge activation while continuing to block every valid hit during the remaining i-frames.
+
+The perfect sub-window should initially sit near the front of the existing `0.03s → 0.19s` i-frame range, then be tuned from recorded enemy contact times. Required cleanup cases are the same as normal dodge: montage interruption, death, landing, and actor destruction must remove the state and restore movement exactly once. This feature remains design/implementation work for a later pass.

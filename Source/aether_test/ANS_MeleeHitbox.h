@@ -57,6 +57,10 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Hitbox|Reaction")
 	bool bPlayHitReaction = true;
 
+	/** Camera shake intensity after a confirmed hit. Zero disables the shake for this window. */
+	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float CameraShakeScale = 0.35f;
+
 	/** Optional stamina cost paid when this authored hit window starts (E uses 12.5 x 4). */
 	UPROPERTY(EditAnywhere, Category = "Hitbox|Stamina", meta = (ClampMin = "0.0"))
 	float StaminaCostOnBegin = 0.f;

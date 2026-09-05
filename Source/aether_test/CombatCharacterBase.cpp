@@ -5,6 +5,10 @@
 #include "Blueprint/UserWidget.h"
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/SpringArmComponent.h"
+#include "Camera/CameraComponent.h"
+#include "Camera/CameraShakeBase.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Components/ProgressBar.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/WidgetComponent.h"
@@ -15,6 +19,7 @@
 #include "GameplayEffect.h"
 #include "GameplayAbilitySpec.h"
 #include "TimerManager.h"
+#include "CombatCameraShake.h"
 
 ACombatCharacterBase::ACombatCharacterBase()
 {
@@ -30,6 +35,11 @@ void ACombatCharacterBase::BeginPlay()
 	Super::BeginPlay();
 	InitAbilitySystem();
 
+	// Combat characters must not collapse the player's spring arm when they
+	// move between the camera and its target. World geometry still blocks it.
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+	GetMesh()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+
 	// BeginPlay can run before the local game viewport/subsystem is ready.
 	// Defer the first attempt so AddToViewport has a valid screen target.
 	if (UWorld* World = GetWorld())
@@ -42,6 +52,7 @@ void ACombatCharacterBase::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	UpdateCombatFacing(DeltaSeconds);
+	UpdateCombatCamera(DeltaSeconds);
 }
 
 void ACombatCharacterBase::Landed(const FHitResult& Hit)
@@ -367,6 +378,23 @@ void ACombatCharacterBase::ApplyCombatKnockback(FVector Direction, float Horizon
 		LiftZ > 0.f);
 }
 
+void ACombatCharacterBase::PlayCombatCameraShake(float Scale)
+{
+	if (Scale <= 0.f || !IsPlayerControlled())
+	{
+		return;
+	}
+
+	APlayerController* PlayerController = Cast<APlayerController>(GetController());
+	if (!PlayerController || !PlayerController->IsLocalController() || !PlayerController->PlayerCameraManager)
+	{
+		return;
+	}
+
+	PlayerController->PlayerCameraManager->StartCameraShake(
+		UCombatHitCameraShake::StaticClass(), FMath::Clamp(Scale, 0.f, 2.f));
+}
+
 void ACombatCharacterBase::PlayLaunchReaction()
 {
 	if (LaunchReactionMontage)
@@ -604,6 +632,55 @@ void ACombatCharacterBase::UpdateCombatFacing(float DeltaSeconds)
 	DesiredRotation.Pitch = 0.f;
 	DesiredRotation.Roll = 0.f;
 	SetActorRotation(FMath::RInterpTo(GetActorRotation(), DesiredRotation, DeltaSeconds, AutoFaceTurnSpeed));
+}
+
+void ACombatCharacterBase::UpdateCombatCamera(float DeltaSeconds)
+{
+	if (!bCombatCameraEnabled || bIsDead || !IsPlayerControlled())
+	{
+		return;
+	}
+
+	USpringArmComponent* CameraBoom = FindComponentByClass<USpringArmComponent>();
+	UCameraComponent* FollowCamera = FindComponentByClass<UCameraComponent>();
+	if (!CameraBoom || !FollowCamera)
+	{
+		return;
+	}
+
+	if (!bCameraFollowTuningApplied)
+	{
+		// The Blueprint boom is attached near the capsule/pelvis. Keep the target point
+		// on the torso and damp both translation and rotation so jump/root-motion
+		// animation is not transferred directly into the player's view.
+		CameraBoom->TargetOffset.Z += CombatCameraTargetOffsetZ;
+		CameraBoom->bEnableCameraLag = true;
+		CameraBoom->CameraLagSpeed = FMath::Max(1.f, CombatCameraLagSpeed);
+		CameraBoom->CameraLagMaxDistance = FMath::Max(0.f, CombatCameraLagMaxDistance);
+		CameraBoom->bUseCameraLagSubstepping = true;
+		CameraBoom->bEnableCameraRotationLag = true;
+		CameraBoom->CameraRotationLagSpeed = FMath::Max(1.f, CombatCameraRotationLagSpeed);
+		// Keep the horizon level when an airborne/root-motion move rolls the pawn.
+		CameraBoom->bInheritRoll = false;
+		bCameraFollowTuningApplied = true;
+	}
+
+	if (!bCameraDefaultsCaptured)
+	{
+		DefaultCameraArmLength = CameraBoom->TargetArmLength;
+		DefaultCameraFOV = FollowCamera->FieldOfView;
+		bCameraDefaultsCaptured = true;
+	}
+
+	const bool bCombatTargetValid = IsValid(CurrentCombatTarget) && !CurrentCombatTarget->bIsDead;
+	const float TargetArmLength = bCombatTargetValid ? CombatCameraArmLength : DefaultCameraArmLength;
+	const float TargetFOV = bCombatTargetValid ? CombatCameraFOV : DefaultCameraFOV;
+	const float InterpSpeed = FMath::Max(1.f, CombatCameraInterpSpeed);
+
+	CameraBoom->TargetArmLength = FMath::FInterpTo(
+		CameraBoom->TargetArmLength, TargetArmLength, DeltaSeconds, InterpSpeed);
+	FollowCamera->FieldOfView = FMath::FInterpTo(
+		FollowCamera->FieldOfView, TargetFOV, DeltaSeconds, InterpSpeed);
 }
 
 ACombatCharacterBase* ACombatCharacterBase::FindNearestCombatTarget() const

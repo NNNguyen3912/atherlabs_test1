@@ -92,7 +92,7 @@ ApplyCombatKnockback(Direction, Strength, LiftZ)
 
 ### Deferred feedback/performance pass
 
-Camera shake remains a Blueprint callback/Phase 7 concern; this phase only adds the reusable displacement primitive and the per-window reaction toggle.
+Camera shake is handled by the native Phase 7 feedback path; this phase only adds the reusable displacement primitive and the per-window reaction toggle.
 
 The native world-sweep optimization is intentionally deferred until the behavior is visually verified. The current test wave is small, so changing trace plumbing before tuning hit timing would increase risk without a measurable win.
 
@@ -251,6 +251,20 @@ Failsafes:
 
 Test dodge during A1–A4, S4–S7, L2 and D3. It must cancel immediately, avoid enemy damage during the window and allow attack/movement again after the montage.
 
+### Perfect dodge analysis (deferred; no implementation in this pass)
+
+Normal dodge i-frames and perfect dodge are different results. The normal window prevents damage; the perfect sub-window is a narrow portion near the start of that window and is awarded only when an enemy `ANS_MeleeHitbox` actually reaches the dodging player. Pressing dodge near an enemy without contact must not count.
+
+Keep the decision in the incoming-hit resolver, not in the input event:
+
+```text
+outside i-frames → normal damage/reaction
+normal i-frames  → reject damage
+perfect window   → reject damage + emit one PerfectDodge event
+```
+
+The existing `UANS_MeleeHitbox` socket sweep is the right contact source. A future native resolver should return a small result enum (damaged / invulnerable / perfect dodge) before poison, launch, hit reaction, stamina refund, camera cue, or VFX are dispatched. Consume the perfect response once per dodge activation, but keep the rest of the i-frame window valid against additional hitboxes. Cleanup must cover montage interruption, death, landing, and destruction.
+
 ## 8. Phase 6 — HUD
 
 Current native HUD is anchored bottom-left. Move it to top-left so it is visible in the expected review position:
@@ -278,6 +292,14 @@ E4 / Dive impact:      heavy
 
 Use the notify's `CameraShakeScale`, so each hit is tuned on the animation timeline. A whiff must not shake the camera.
 
+### Native implementation
+
+- `UCombatHitCameraShake` is a self-contained native shake pattern with a short `0.13s` pulse and no asset dependency.
+- `UANS_MeleeHitbox::CameraShakeScale` defaults to `0.35`; `ACombatCharacterBase::PlayCombatCameraShake()` ignores non-local characters and is called only after confirmed damage.
+- While a live combat target exists, `ACombatCharacterBase` interpolates the existing SpringArm to `520uu` and the follow camera to `86` FOV. Losing the target restores the captured defaults; SpringArm collision testing remains enabled.
+- The combat follow is stabilized on the existing SpringArm: the native path raises `TargetOffset.Z` by `40uu`, enables position/rotation lag (`8`/`10`), caps lag distance at `90uu`, enables lag substepping, and disables pawn roll inheritance so jump/root-motion/airborne turns do not copy 1:1 into the view. World collision testing remains enabled.
+- Build and runtime shake-start smoke test are green. Standard PIE single-block A/B test confirms an enemy no longer collapses the SpringArm: the same blocker keeps the camera at about `400uu` instead of `154uu`; combat target framing reaches about `520uu` with FOV `86`. Follow stabilization also passes the PIE smoke check, but chaotic continuous combos can still zoom into an enemy, so Phase 7 remains open for target-switching/occlusion diagnosis.
+
 ### Optional if time remains
 
 Use a small spring-arm interpolation while a combat target exists:
@@ -290,6 +312,16 @@ Combat FOV:        84–87
 ```
 
 Use FOV punch and shake for E4/Dive impact. Avoid per-move cinematic camera angles until the core combat is stable.
+
+### Planned VFX integration (analysis only)
+
+The new content is mounted under `/Game/Vefects/Easy_Impact_Frames` and contains 200 `.uasset` files, including the Niagara systems in `VFX/Frames/Particles` and their dependencies. Candidate impact systems include `NS_Impact_Frame_01` plus the explicit `Always`, `Static`, `Distortion`, and `Advanced` variants. No asset has been wired into a montage yet.
+
+Use an animation notify/state for unconditional action VFX: slash, trail, charge flash, and dust should play at the authored frame/socket and complete their own finite Niagara lifetime. Do not use that unconditional path for an impact frame. For confirmed-hit VFX, add an optional Niagara reference to `UANS_MeleeHitbox`; after `ApplyDamageToTarget()` returns `true`, spawn at the `FHitResult` impact point/normal, once per victim per active notify window. A whiff or rejected hit must not spawn impact VFX. This preserves the current hitbox `HitActors` dedupe and keeps animation timing separate from gameplay truth.
+
+### E4/S7 finisher cinematic (analysis only)
+
+Start only on the first confirmed S7 hit. Snapshot living enemies in a bounded radius, slow only that set with tracked temporary state, and leave the player input/HUD responsive. Enter a dedicated camera mode that temporarily owns the SpringArm/control rotation, eases a short orbit around the player at torso height, and blends back without competing with `UpdateCombatCamera()`. Layer unconditional attack VFX, confirmed impact-frame VFX, and a floor-traced stomp ring separately. Restore time dilation, camera ownership, control rotation, and finisher state on complete, interrupted, death, or destruction. Begin QA with one enemy plus a debug orbit, then add multi-target slow motion.
 
 ## 10. Verification loop
 
@@ -357,5 +389,5 @@ If time drops below four hours, ship in this order: dodge cancel, Dive multi-hit
 - [x] Poison/contact regression guard (debug input removed; enemy hit delayed to authored contact; extra effect requires confirmed damage).
 - [ ] Phase 5: dodge cancel + i-frames.
 - [ ] Phase 6: HUD placement/readiness indicator (native layout + E READY text ready; PIE visual check pending).
-- [ ] Phase 7: camera feedback/framing.
+- [ ] Phase 7: native camera shake + combat framing implementation (single-block A/B green; chaotic continuous-combo stress case still reproduces enemy zoom).
 - [ ] Phase 8: final regression and delivery documentation.
