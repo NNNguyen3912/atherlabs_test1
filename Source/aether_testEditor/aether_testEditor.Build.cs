@@ -12,6 +12,8 @@ public class aether_testEditor : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			"Niagara",
+			"NiagaraAnimNotifies",
 			"UnrealEd",
 			"BlueprintGraph",
 			"LevelEditor",

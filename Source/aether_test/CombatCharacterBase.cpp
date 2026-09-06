@@ -20,6 +20,8 @@
 #include "GameplayAbilitySpec.h"
 #include "TimerManager.h"
 #include "CombatCameraShake.h"
+#include "NiagaraFunctionLibrary.h"
+#include "NiagaraSystem.h"
 
 ACombatCharacterBase::ACombatCharacterBase()
 {
@@ -46,6 +48,12 @@ void ACombatCharacterBase::BeginPlay()
 	{
 		World->GetTimerManager().SetTimerForNextTick(this, &ACombatCharacterBase::CreatePlayerHUDIfNeeded);
 	}
+}
+
+void ACombatCharacterBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	EndFinisherCinematic();
+	Super::EndPlay(EndPlayReason);
 }
 
 void ACombatCharacterBase::Tick(float DeltaSeconds)
@@ -395,6 +403,113 @@ void ACombatCharacterBase::PlayCombatCameraShake(float Scale)
 		UCombatHitCameraShake::StaticClass(), FMath::Clamp(Scale, 0.f, 2.f));
 }
 
+void ACombatCharacterBase::BeginFinisherCinematic(ACombatCharacterBase* InitialVictim, UNiagaraSystem* FinisherVFX)
+{
+	if (bFinisherCinematicActive || !bFinisherCinematicEnabled || bIsDead || !IsPlayerControlled())
+	{
+		return;
+	}
+
+	USpringArmComponent* CameraBoom = FindComponentByClass<USpringArmComponent>();
+	UCameraComponent* FollowCamera = FindComponentByClass<UCameraComponent>();
+	APlayerController* PlayerController = Cast<APlayerController>(GetController());
+	if (!CameraBoom || !FollowCamera || !PlayerController || !PlayerController->IsLocalController())
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	FinisherPlayerController = PlayerController;
+	FinisherStartControlRotation = PlayerController->GetControlRotation();
+	FinisherStartBoomRotation = CameraBoom->GetComponentRotation();
+	FinisherStartTargetOffset = CameraBoom->TargetOffset;
+	bFinisherUsesControlRotation = CameraBoom->bUsePawnControlRotation;
+	FinisherCinematicElapsed = 0.f;
+	bFinisherCinematicActive = true;
+	FinisherMontage = GetMesh() && GetMesh()->GetAnimInstance()
+		? GetMesh()->GetAnimInstance()->GetCurrentActiveMontage()
+		: nullptr;
+
+	FinisherSlowTargets.Reset();
+	auto SlowTarget = [this](ACombatCharacterBase* Candidate)
+	{
+		if (!Candidate || Candidate == this || Candidate->bIsDead || Candidate->IsPlayerControlled()
+			|| FVector::DistSquared2D(GetActorLocation(), Candidate->GetActorLocation()) > FMath::Square(FinisherSlowRadius)
+			|| FinisherSlowTargets.ContainsByPredicate([Candidate](const FFinisherSlowTarget& Existing)
+			{
+				return Existing.Character.Get() == Candidate;
+			}))
+		{
+			return;
+		}
+
+		FFinisherSlowTarget& State = FinisherSlowTargets.AddDefaulted_GetRef();
+		State.Character = Candidate;
+		State.OriginalTimeDilation = Candidate->CustomTimeDilation;
+		Candidate->CustomTimeDilation = FMath::Min(Candidate->CustomTimeDilation, FinisherEnemyTimeDilation);
+	};
+
+	SlowTarget(InitialVictim);
+	for (TActorIterator<ACombatCharacterBase> It(World); It; ++It)
+	{
+		SlowTarget(*It);
+	}
+
+	if (FinisherVFX)
+	{
+		const float CapsuleHalfHeight = GetCapsuleComponent()
+			? GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
+			: 88.f;
+		UNiagaraFunctionLibrary::SpawnSystemAtLocation(
+			this, FinisherVFX,
+			GetActorLocation() - FVector(0.f, 0.f, CapsuleHalfHeight - 5.f),
+			FRotator::ZeroRotator, FVector(1.15f), true, true);
+	}
+}
+
+void ACombatCharacterBase::EndFinisherCinematic()
+{
+	for (const FFinisherSlowTarget& State : FinisherSlowTargets)
+	{
+		if (ACombatCharacterBase* Character = State.Character.Get())
+		{
+			Character->CustomTimeDilation = State.OriginalTimeDilation;
+		}
+	}
+	FinisherSlowTargets.Reset();
+
+	if (bFinisherCinematicActive)
+	{
+		if (APlayerController* PlayerController = FinisherPlayerController.Get())
+		{
+			if (bFinisherUsesControlRotation)
+			{
+				PlayerController->SetControlRotation(FinisherStartControlRotation);
+			}
+		}
+
+		if (USpringArmComponent* CameraBoom = FindComponentByClass<USpringArmComponent>())
+		{
+			CameraBoom->TargetOffset = FinisherStartTargetOffset;
+			if (!bFinisherUsesControlRotation)
+			{
+				CameraBoom->SetWorldRotation(FinisherStartBoomRotation);
+			}
+		}
+	}
+
+	bFinisherCinematicActive = false;
+	FinisherCinematicElapsed = 0.f;
+	FinisherMontage = nullptr;
+	FinisherPlayerController.Reset();
+	bFinisherUsesControlRotation = false;
+}
+
 void ACombatCharacterBase::PlayLaunchReaction()
 {
 	if (LaunchReactionMontage)
@@ -442,6 +557,8 @@ void ACombatCharacterBase::HandleHealthChanged(const FOnAttributeChangeData& Dat
 
 void ACombatCharacterBase::HandleCombatDeath()
 {
+	EndFinisherCinematic();
+
 	if (bStopMovementOnDeath)
 	{
 		if (AController* OwningController = GetController())
@@ -648,6 +765,12 @@ void ACombatCharacterBase::UpdateCombatCamera(float DeltaSeconds)
 		return;
 	}
 
+	if (bFinisherCinematicActive)
+	{
+		UpdateFinisherCinematic(DeltaSeconds);
+		return;
+	}
+
 	if (!bCameraFollowTuningApplied)
 	{
 		// The Blueprint boom is attached near the capsule/pelvis. Keep the target point
@@ -681,6 +804,59 @@ void ACombatCharacterBase::UpdateCombatCamera(float DeltaSeconds)
 		CameraBoom->TargetArmLength, TargetArmLength, DeltaSeconds, InterpSpeed);
 	FollowCamera->FieldOfView = FMath::FInterpTo(
 		FollowCamera->FieldOfView, TargetFOV, DeltaSeconds, InterpSpeed);
+}
+
+void ACombatCharacterBase::UpdateFinisherCinematic(float DeltaSeconds)
+{
+	USpringArmComponent* CameraBoom = FindComponentByClass<USpringArmComponent>();
+	UCameraComponent* FollowCamera = FindComponentByClass<UCameraComponent>();
+	APlayerController* PlayerController = FinisherPlayerController.Get();
+	if (!CameraBoom || !FollowCamera || !PlayerController || !PlayerController->IsLocalController())
+	{
+		EndFinisherCinematic();
+		return;
+	}
+
+	if (FinisherMontage)
+	{
+		UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
+		if (!AnimInstance || AnimInstance->GetCurrentActiveMontage() != FinisherMontage)
+		{
+			EndFinisherCinematic();
+			return;
+		}
+	}
+
+	FinisherCinematicElapsed += FMath::Max(0.f, DeltaSeconds);
+	const float Alpha = FMath::Clamp(
+		FinisherCinematicElapsed / FMath::Max(0.1f, FinisherCinematicDuration), 0.f, 1.f);
+	const float Ease = FMath::InterpEaseInOut(0.f, 1.f, Alpha, 2.f);
+	FRotator DesiredRotation = FinisherStartControlRotation;
+	DesiredRotation.Yaw += FinisherCameraOrbitDegrees * Ease;
+	DesiredRotation.Pitch += FinisherCameraPitchOffset * Ease;
+	DesiredRotation.Roll = 0.f;
+
+	if (bFinisherUsesControlRotation)
+	{
+		PlayerController->SetControlRotation(DesiredRotation);
+	}
+	else
+	{
+		CameraBoom->SetWorldRotation(DesiredRotation);
+	}
+
+	CameraBoom->TargetArmLength = FMath::FInterpTo(
+		CameraBoom->TargetArmLength, FinisherCameraArmLength, DeltaSeconds, FinisherCameraInterpSpeed);
+	CameraBoom->TargetOffset.Z = FMath::FInterpTo(
+		CameraBoom->TargetOffset.Z, FinisherStartTargetOffset.Z + 25.f,
+		DeltaSeconds, FinisherCameraInterpSpeed);
+	FollowCamera->FieldOfView = FMath::FInterpTo(
+		FollowCamera->FieldOfView, FinisherCameraFOV, DeltaSeconds, FinisherCameraInterpSpeed);
+
+	if (Alpha >= 1.f)
+	{
+		EndFinisherCinematic();
+	}
 }
 
 ACombatCharacterBase* ACombatCharacterBase::FindNearestCombatTarget() const

@@ -218,9 +218,9 @@ The implementation pass preceding this audit was built for both game and editor 
 
 This document records the source-level combo audit and the expected interpretation of the observed `COMBO x21`. No combat code, Blueprint graph, montage timing, or HUD behavior was changed to produce this documentation.
 
-## 12. Planned VFX trigger contract
+## 12. VFX trigger contract — first pass implemented
 
-The imported `Easy_Impact_Frames` pack is currently content only; no montage notify or gameplay wiring has been added yet. The pack is mounted under `/Game/Vefects/Easy_Impact_Frames` and contains 200 `.uasset` files, including Niagara systems in `VFX/Frames/Particles`, their materials/textures, demo maps, a demo character, and helper Blueprints. The first candidate to preview is `NS_Impact_Frame_01`; the `Always`, `Static`, `Distortion`, and `Advanced` variants should remain explicit designer choices rather than being auto-selected by combat code.
+The first pass wires the imported `Easy_Impact_Frames` pack under `/Game/Vefects/Easy_Impact_Frames`. The pack contains 200 `.uasset` files; the runtime candidate is `NS_Impact_Frame_01` and the S7 author-time burst uses `NS_Impact_Frame_01_Always`. The other `Static`, `Distortion`, and `Advanced` variants remain explicit designer choices.
 
 Use two separate notify lanes:
 
@@ -238,25 +238,25 @@ Slash streaks, weapon trails, anticipation flashes, and ground dust that describ
 
 ### Confirmed-hit effects
 
-An impact frame is not an unconditional one-shot notify, because it would play on a whiff. The planned integration is an optional `UNiagaraSystem* ImpactVFX` on `UANS_MeleeHitbox`. After the existing `ApplyDamageToTarget()` gate returns `true`, the notify spawns the system at the confirmed `FHitResult` impact point, oriented from the hit normal; if the trace does not provide a useful point, fall back to the victim's capsule/mesh location. The spawn occurs once per victim per active hitbox window because `HitActors` already owns that dedupe. A miss, dead target, rejected damage, or invulnerable target produces no impact frame, poison, launch, or hit-confirm VFX.
+An impact frame is not an unconditional one-shot notify, because it would play on a whiff. The first pass implements optional `ConfirmedHitVFX` on `UANS_MeleeHitbox`. After the existing `ApplyDamageToTarget()` gate returns `true`, the notify spawns the system at the confirmed `FHitResult` impact point, oriented from the hit normal; if the trace does not provide a useful point, it falls back to the victim location. The spawn occurs once per victim per active hitbox window because `HitActors` already owns that dedupe. A miss, dead target, rejected damage, or invulnerable target produces no confirmed impact VFX.
 
 This keeps visual timing on the animation while keeping truth in gameplay: the notify says *when an attack can connect*, and the hit resolver says *whether it actually connected*. Impact systems should be finite/auto-deactivating; infinite systems belong to a separate stateful effect with an explicit cleanup path.
 
-## 13. E4/S7 finisher cinematic — analysis only
+## 13. E4/S7 finisher cinematic — first pass implemented
 
-The final E attack is `S7` in the current `[S4, S5, S6, S7]` skill lane. The cinematic should begin only after the S7 hit window confirms at least one real victim. A whiff must finish as an ordinary attack: no time dilation, orbit, impact frame, or finisher camera shake.
+The final E attack is `S7` in the current `[S4, S5, S6, S7]` skill lane. The first pass starts only after the S7 hit window confirms at least one real victim. A whiff remains an ordinary attack: the confirmed impact path and finisher camera are not entered.
 
-Proposed sequence:
+Implemented sequence:
 
-1. Keep the S7 `ANS_MeleeHitbox` as the sole damage authority and guard the cinematic with one `bFinisherCinematicStarted` flag per montage activation.
-2. On the first confirmed hit, snapshot nearby living enemies inside a bounded radius. Temporarily slow only those enemies through a tracked per-actor time-dilation/paused-combat state; avoid global time dilation in the first pass so input, HUD, and the player camera remain responsive.
-3. Enter a dedicated finisher camera mode. Save the normal SpringArm/control-rotation state, drive a short orbit around the player with eased yaw and fixed torso-height framing, then blend back before restoring normal combat camera ownership. The regular `UpdateCombatCamera()` must not fight the scripted orbit.
-4. Layer the effects by truth: authored slash/charge effects on the timeline, confirmed impact frame at each valid victim, and a separate floor-traced stomp ring at the landing point. Apply the largest shake/FOV punch only after confirmation and keep it short so it does not compete with the orbit.
-5. On montage completion, interruption, death, or actor destruction, restore enemy time dilation, camera ownership, control rotation, and any finisher flag exactly once.
+1. The S7 `ANS_MeleeHitbox` owns `bStartFinisherCinematic`; the existing damage gate remains authoritative.
+2. On the first confirmed hit, snapshot living `ACombatCharacterBase` enemies within `900uu`, store each original `CustomTimeDilation`, and slow them to `0.18`. The player and enemies outside the radius are not slowed.
+3. `BeginFinisherCinematic()` temporarily drives the existing camera through control rotation, easing `110°` of yaw over `0.9s`, with a `390uu` arm and `76°` FOV target. Normal `UpdateCombatCamera()` yields while this mode is active.
+4. `NS_Impact_Frame_01_Always` is attached to S7 as a one-shot `Play Niagara Effect` notify at the authored contact time. The confirmed `NS_Impact_Frame_01` path remains hit-gated and is spawned at each valid impact point.
+5. `EndFinisherCinematic()` restores all tracked dilation and control/camera state. It also runs on montage interruption, death, and `EndPlay`; the normal camera code then interpolates arm/FOV back to combat framing.
 
-The first QA pass should use one enemy and a debug orbit before adding multi-enemy slow motion. Acceptance is: whiff has no cinematic, one confirmed hit starts one orbit, multiple victims do not restart it, enemies outside the radius remain normal, and every interruption leaves no slow-motion or camera state behind.
+PIE smoke verification confirmed the active flag, `0.18` enemy dilation, Niagara component spawn, and automatic restoration to `1.0` after the short sequence. Visual tuning and a manual controller-driven S7 hit against a real target remain QA follow-ups.
 
-## 14. Perfect dodge — analysis only
+## 14. Perfect dodge — deferred
 
 The existing Phase 5 plan describes a normal dodge with movement plus a broad invulnerability window. Perfect dodge is a narrower result inside that dodge, not a second input: an enemy hitbox must actually reach the player during the perfect sub-window. Merely pressing dodge near an enemy is not enough.
 

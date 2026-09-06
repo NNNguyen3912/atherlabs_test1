@@ -313,15 +313,15 @@ Combat FOV:        84–87
 
 Use FOV punch and shake for E4/Dive impact. Avoid per-move cinematic camera angles until the core combat is stable.
 
-### Planned VFX integration (analysis only)
+### VFX integration (first pass implemented)
 
-The new content is mounted under `/Game/Vefects/Easy_Impact_Frames` and contains 200 `.uasset` files, including the Niagara systems in `VFX/Frames/Particles` and their dependencies. Candidate impact systems include `NS_Impact_Frame_01` plus the explicit `Always`, `Static`, `Distortion`, and `Advanced` variants. No asset has been wired into a montage yet.
+The new content is mounted under `/Game/Vefects/Easy_Impact_Frames` and contains 200 `.uasset` files, including Niagara systems in `VFX/Frames/Particles` and their dependencies. The first pass wires `NS_Impact_Frame_01` as confirmed-hit VFX on 13 player hitbox windows across 10 montages, and uses `NS_Impact_Frame_01_Always` for the S7 action notify.
 
-Use an animation notify/state for unconditional action VFX: slash, trail, charge flash, and dust should play at the authored frame/socket and complete their own finite Niagara lifetime. Do not use that unconditional path for an impact frame. For confirmed-hit VFX, add an optional Niagara reference to `UANS_MeleeHitbox`; after `ApplyDamageToTarget()` returns `true`, spawn at the `FHitResult` impact point/normal, once per victim per active notify window. A whiff or rejected hit must not spawn impact VFX. This preserves the current hitbox `HitActors` dedupe and keeps animation timing separate from gameplay truth.
+The S7 montage now has a one-shot `Play Niagara Effect` notify at the authored contact time. It is allowed to run on a whiff and owns the Niagara system's finite lifetime. Confirmed-hit VFX is separate: `UANS_MeleeHitbox::ConfirmedHitVFX` spawns only after `ApplyDamageToTarget()` returns `true`, at the `FHitResult` impact point/normal, once per victim per active notify window. A whiff or rejected hit does not spawn the confirmed effect.
 
-### E4/S7 finisher cinematic (analysis only)
+### E4/S7 finisher cinematic (first pass implemented)
 
-Start only on the first confirmed S7 hit. Snapshot living enemies in a bounded radius, slow only that set with tracked temporary state, and leave the player input/HUD responsive. Enter a dedicated camera mode that temporarily owns the SpringArm/control rotation, eases a short orbit around the player at torso height, and blends back without competing with `UpdateCombatCamera()`. Layer unconditional attack VFX, confirmed impact-frame VFX, and a floor-traced stomp ring separately. Restore time dilation, camera ownership, control rotation, and finisher state on complete, interrupted, death, or destruction. Begin QA with one enemy plus a debug orbit, then add multi-target slow motion.
+Start only on the first confirmed S7 hit. The native implementation snapshots living enemies within `900uu`, slows them to `0.18`, and tracks original dilation per actor. `BeginFinisherCinematic()` temporarily owns the existing camera control rotation and eases a `110°` orbit over `0.9s`, targeting `390uu` arm length and `76°` FOV. `UpdateCombatCamera()` yields while active. `EndFinisherCinematic()` restores dilation and camera state on normal completion, montage change, death, and `EndPlay`. PIE smoke verified active state, Niagara spawn, and dilation restoration; controller-driven hit feel still needs manual tuning.
 
 ## 10. Verification loop
 
@@ -389,5 +389,5 @@ If time drops below four hours, ship in this order: dodge cancel, Dive multi-hit
 - [x] Poison/contact regression guard (debug input removed; enemy hit delayed to authored contact; extra effect requires confirmed damage).
 - [ ] Phase 5: dodge cancel + i-frames.
 - [ ] Phase 6: HUD placement/readiness indicator (native layout + E READY text ready; PIE visual check pending).
-- [ ] Phase 7: native camera shake + combat framing implementation (single-block A/B green; chaotic continuous-combo stress case still reproduces enemy zoom).
+- [ ] Phase 7: native camera shake + combat framing implementation (single-block A/B green; chaotic continuous-combo stress case still reproduces enemy zoom; finisher orbit/VFX first pass added, visual polish pending).
 - [ ] Phase 8: final regression and delivery documentation.

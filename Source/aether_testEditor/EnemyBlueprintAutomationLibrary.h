@@ -52,4 +52,8 @@ public:
 	/** Restores a readable wind-up to AM_Enemy_Attack and aligns its damaging window with contact. */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Editor")
 	static FString ConfigureEnemyAttackTelegraph();
+
+	/** Wires confirmed-hit Niagara VFX and the S7 finisher notify into authored player montages. */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Editor")
+	static FString ConfigureCombatVFXAndFinisher();
 };

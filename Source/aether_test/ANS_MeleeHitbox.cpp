@@ -4,6 +4,8 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Engine/EngineTypes.h"
+#include "NiagaraFunctionLibrary.h"
+#include "NiagaraSystem.h"
 
 FVector UANS_MeleeHitbox::GetHitboxLocation(const USkeletalMeshComponent* MeshComp) const
 {
@@ -108,6 +110,40 @@ void UANS_MeleeHitbox::NotifyTick(USkeletalMeshComponent* MeshComp, UAnimSequenc
 		{
 			continue;
 		}
+
+		if (ConfirmedHitVFX)
+		{
+			FVector ImpactLocation = Hit.ImpactPoint;
+			if (ImpactLocation.IsNearlyZero())
+			{
+				ImpactLocation = Hit.Location;
+			}
+			if (ImpactLocation.IsNearlyZero())
+			{
+				ImpactLocation = Victim->GetActorLocation();
+			}
+
+			FVector ImpactNormal = Hit.Normal;
+			if (ImpactNormal.IsNearlyZero())
+			{
+				ImpactNormal = (Attacker->GetActorLocation() - ImpactLocation).GetSafeNormal();
+			}
+			if (ImpactNormal.IsNearlyZero())
+			{
+				ImpactNormal = FVector::UpVector;
+			}
+
+			UNiagaraFunctionLibrary::SpawnSystemAtLocation(
+				MeshComp, ConfirmedHitVFX, ImpactLocation,
+				FRotationMatrix::MakeFromZ(ImpactNormal).Rotator(),
+				FVector(FMath::Max(0.01f, ConfirmedHitVFXScale)), true, true);
+		}
+
+		if (bStartFinisherCinematic && Attacker->IsPlayerControlled())
+		{
+			Attacker->BeginFinisherCinematic(Victim, FinisherVFX);
+		}
+
 		Attacker->PlayCombatCameraShake(CameraShakeScale);
 		Victim->PlayCombatCameraShake(CameraShakeScale);
 		if (bOnlyHitPlayers)

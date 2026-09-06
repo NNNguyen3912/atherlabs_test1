@@ -12,8 +12,10 @@ class UGameplayEffect;
 class UAnimMontage;
 class UAnimSequenceBase;
 class UCameraShakeBase;
+class UNiagaraSystem;
 class UCombatPlayerHUDWidget;
 class ACombatCharacterBase;
+class APlayerController;
 struct FOnAttributeChangeData;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FCombatAttributeChanged, float, NewValue, float, MaxValue);
@@ -109,6 +111,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|Camera")
 	void PlayCombatCameraShake(float Scale = 1.f);
 
+	/** Starts the short E4/S7 camera orbit and slows living enemies around the player. */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Camera")
+	void BeginFinisherCinematic(ACombatCharacterBase* InitialVictim, UNiagaraSystem* FinisherVFX = nullptr);
+
+	/** Restores camera and per-enemy time dilation after the finisher or an interruption. */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Camera")
+	void EndFinisherCinematic();
+
+	UFUNCTION(BlueprintPure, Category = "Combat|Camera")
+	bool IsFinisherCinematicActive() const { return bFinisherCinematicActive; }
+
 	/** BP callback de them VFX/camera shake sau khi phan ung hit mac dinh da chay. */
 	UFUNCTION(BlueprintImplementableEvent, Category = "GAS")
 	void OnMeleeHitReceived(ACombatCharacterBase* Attacker);
@@ -167,6 +180,7 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
 	virtual void Landed(const FHitResult& Hit) override;
 	virtual void PossessedBy(AController* NewController) override;
@@ -188,6 +202,7 @@ protected:
 	void CreatePlayerHUDIfNeeded();
 	void UpdateCombatFacing(float DeltaSeconds);
 	void UpdateCombatCamera(float DeltaSeconds);
+	void UpdateFinisherCinematic(float DeltaSeconds);
 	ACombatCharacterBase* FindNearestCombatTarget() const;
 
 	/** Keeps an optional world-space/screen-space HPBar widget in sync with GAS. */
@@ -257,6 +272,33 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera", meta = (ClampMin = "0.0"))
 	float CombatCameraLagMaxDistance = 90.f;
 
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher")
+	bool bFinisherCinematicEnabled = true;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "0.1", ClampMax = "3.0"))
+	float FinisherCinematicDuration = 0.9f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "100.0"))
+	float FinisherSlowRadius = 900.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "0.01", ClampMax = "1.0"))
+	float FinisherEnemyTimeDilation = 0.18f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "100.0"))
+	float FinisherCameraArmLength = 390.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "1.0", ClampMax = "179.0"))
+	float FinisherCameraFOV = 76.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher")
+	float FinisherCameraOrbitDegrees = 110.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher")
+	float FinisherCameraPitchOffset = 3.f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "1.0"))
+	float FinisherCameraInterpSpeed = 10.f;
+
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "Combat|Targeting")
 	TObjectPtr<ACombatCharacterBase> CurrentCombatTarget;
 
@@ -277,6 +319,26 @@ protected:
 
 	UPROPERTY(Transient)
 	bool bCameraFollowTuningApplied = false;
+
+	struct FFinisherSlowTarget
+	{
+		TWeakObjectPtr<ACombatCharacterBase> Character;
+		float OriginalTimeDilation = 1.f;
+	};
+
+	bool bFinisherCinematicActive = false;
+
+	float FinisherCinematicElapsed = 0.f;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UAnimMontage> FinisherMontage;
+
+	TWeakObjectPtr<APlayerController> FinisherPlayerController;
+	FRotator FinisherStartControlRotation = FRotator::ZeroRotator;
+	FRotator FinisherStartBoomRotation = FRotator::ZeroRotator;
+	FVector FinisherStartTargetOffset = FVector::ZeroVector;
+	bool bFinisherUsesControlRotation = false;
+	TArray<FFinisherSlowTarget> FinisherSlowTargets;
 
 	FTimerHandle ComboResetTimer;
 

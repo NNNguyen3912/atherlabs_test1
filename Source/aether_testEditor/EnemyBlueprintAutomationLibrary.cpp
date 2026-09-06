@@ -5,6 +5,7 @@
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
 #include "Animation/AnimNotifies/AnimNotifyState.h"
+#include "AnimNotify_PlayNiagaraEffect.h"
 #include "Animation/AnimTypes.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Editor.h"
@@ -31,6 +32,7 @@
 #include "UObject/UnrealType.h"
 #include "PlayInEditorDataTypes.h"
 #include "ScopedTransaction.h"
+#include "NiagaraSystem.h"
 
 FString UEnemyBlueprintAutomationLibrary::ApplyEnemyP0PlayerValidGuard()
 {
@@ -913,4 +915,164 @@ FString UEnemyBlueprintAutomationLibrary::ConfigureEnemyAttackTelegraph()
 		TEXT("Applied: enemy attack length %.3fs -> %.3fs; hit %.3fs -> %.3fs (duration %.3fs); range %.1f -> %.1f."),
 		OldLength, EnemyMontage->GetPlayLength(), OldHitTime, NewHitTime, NewHitDuration,
 		OldAttackRange, NewAttackRange);
+}
+
+FString UEnemyBlueprintAutomationLibrary::ConfigureCombatVFXAndFinisher()
+{
+	UNiagaraSystem* ConfirmedHitVFX = LoadObject<UNiagaraSystem>(nullptr,
+		TEXT("/Game/Vefects/Easy_Impact_Frames/VFX/Frames/Particles/Tests/NS_Impact_Frame_01.NS_Impact_Frame_01"));
+	UNiagaraSystem* ActionVFX = LoadObject<UNiagaraSystem>(nullptr,
+		TEXT("/Game/Vefects/Easy_Impact_Frames/VFX/Frames/Particles/Tests/NS_Impact_Frame_01_Always.NS_Impact_Frame_01_Always"));
+	if (!ConfirmedHitVFX || !ActionVFX)
+	{
+		return TEXT("Refused: Easy_Impact_Frames candidate Niagara systems could not be loaded.");
+	}
+
+	static const TCHAR* MontagePaths[] = {
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A1.AM_Ground_A1"),
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A2.AM_Ground_A2"),
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A3.AM_Ground_A3"),
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A4.AM_Ground_A4"),
+		TEXT("/Game/Game/Combat/Montages/AM_Launcher_L2.AM_Launcher_L2"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S4.AM_Skill_S4"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S5.AM_Skill_S5"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S6.AM_Skill_S6"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S7.AM_Skill_S7"),
+		TEXT("/Game/Game/Combat/Montages/AM_Dive_D3.AM_Dive_D3")
+	};
+
+	int32 ModifiedMontages = 0;
+	int32 ModifiedHitboxes = 0;
+	int32 AddedActionNotifies = 0;
+	FString Missing;
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	SaveArgs.Error = GError;
+
+	for (const TCHAR* Path : MontagePaths)
+	{
+		UAnimMontage* Montage = LoadObject<UAnimMontage>(nullptr, Path);
+		if (!Montage)
+		{
+			if (!Missing.IsEmpty())
+			{
+				Missing += TEXT(", ");
+			}
+			Missing += Path;
+			continue;
+		}
+
+		const bool bIsFinisher = FString(Path).EndsWith(TEXT("AM_Skill_S7.AM_Skill_S7"));
+		float FirstHitTime = -1.f;
+		bool bChanged = false;
+		for (FAnimNotifyEvent& Event : Montage->Notifies)
+		{
+			UANS_MeleeHitbox* Hitbox = Cast<UANS_MeleeHitbox>(Event.NotifyStateClass.Get());
+			if (!Hitbox)
+			{
+				continue;
+			}
+
+			FirstHitTime = FirstHitTime < 0.f ? Event.GetTriggerTime() : FMath::Min(FirstHitTime, Event.GetTriggerTime());
+			Hitbox->Modify();
+			Hitbox->ConfirmedHitVFX = ConfirmedHitVFX;
+			Hitbox->ConfirmedHitVFXScale = bIsFinisher ? 1.15f : 0.9f;
+			Hitbox->bStartFinisherCinematic = bIsFinisher;
+			Hitbox->FinisherVFX = bIsFinisher ? ActionVFX : nullptr;
+			bChanged = true;
+			++ModifiedHitboxes;
+		}
+
+		if (bIsFinisher)
+		{
+			UAnimNotify_PlayNiagaraEffect* ActionNotify = nullptr;
+			FAnimNotifyEvent* ExistingEvent = nullptr;
+			for (FAnimNotifyEvent& Event : Montage->Notifies)
+			{
+				if (UAnimNotify_PlayNiagaraEffect* Candidate = Cast<UAnimNotify_PlayNiagaraEffect>(Event.Notify))
+				{
+					if (Candidate->Template == ActionVFX || Event.NotifyName == FName(TEXT("FinisherActionVFX")))
+					{
+						ActionNotify = Candidate;
+						ExistingEvent = &Event;
+						break;
+					}
+				}
+			}
+
+			if (!ActionNotify)
+			{
+				ActionNotify = NewObject<UAnimNotify_PlayNiagaraEffect>(
+					Montage, UAnimNotify_PlayNiagaraEffect::StaticClass(), NAME_None, RF_Transactional);
+			}
+			if (ActionNotify)
+			{
+				ActionNotify->Modify();
+				ActionNotify->Template = ActionVFX;
+				ActionNotify->Attached = false;
+				ActionNotify->SocketName = TEXT("pelvis");
+				ActionNotify->LocationOffset = FVector(0.f, 0.f, -85.f);
+				ActionNotify->RotationOffset = FRotator::ZeroRotator;
+				ActionNotify->Scale = FVector(1.2f);
+
+				if (!ExistingEvent)
+				{
+					FAnimNotifyEvent& Event = Montage->Notifies.AddDefaulted_GetRef();
+					ExistingEvent = &Event;
+					++AddedActionNotifies;
+				}
+
+				const float TriggerTime = FirstHitTime >= 0.f
+					? FirstHitTime
+					: FMath::Min(0.2f, Montage->GetPlayLength());
+				ExistingEvent->NotifyName = FName(TEXT("FinisherActionVFX"));
+				ExistingEvent->Link(Montage, TriggerTime, 0);
+				ExistingEvent->TriggerTimeOffset = 0.f;
+				ExistingEvent->EndTriggerTimeOffset = 0.f;
+				ExistingEvent->TrackIndex = 2;
+				ExistingEvent->Notify = ActionNotify;
+				ExistingEvent->NotifyStateClass = nullptr;
+				ExistingEvent->MontageTickType = EMontageNotifyTickType::Queued;
+				ExistingEvent->NotifyTriggerChance = 1.f;
+#if WITH_EDITORONLY_DATA
+				ExistingEvent->DisplayTime_DEPRECATED = TriggerTime;
+				if (!ExistingEvent->Guid.IsValid())
+				{
+					ExistingEvent->Guid = FGuid::NewGuid();
+				}
+#endif
+				bChanged = true;
+			}
+		}
+
+		if (!bChanged)
+		{
+			continue;
+		}
+
+		Montage->Modify();
+		Montage->SortNotifies();
+		Montage->InitializeNotifyTrack();
+		Montage->RefreshCacheData();
+		Montage->MarkPackageDirty();
+
+		UPackage* Package = Montage->GetOutermost();
+		FString PackageFileName;
+		if (!Package || !FPackageName::TryConvertLongPackageNameToFilename(
+			Package->GetName(), PackageFileName, FPackageName::GetAssetPackageExtension()) ||
+			!UPackage::SavePackage(Package, Montage, *PackageFileName, SaveArgs))
+		{
+			return FString::Printf(TEXT("Applied in memory, but saving %s failed."), Path);
+		}
+		++ModifiedMontages;
+	}
+
+	FString Result = FString::Printf(
+		TEXT("Applied: confirmed-hit VFX on %d hitboxes across %d montages; S7 action notify added=%d."),
+		ModifiedHitboxes, ModifiedMontages, AddedActionNotifies);
+	if (!Missing.IsEmpty())
+	{
+		Result += FString::Printf(TEXT(" Missing: %s"), *Missing);
+	}
+	return Result;
 }

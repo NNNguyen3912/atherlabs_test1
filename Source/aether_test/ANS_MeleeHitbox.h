@@ -7,6 +7,7 @@
 #include "ANS_MeleeHitbox.generated.h"
 
 class ACombatCharacterBase;
+class UNiagaraSystem;
 
 UENUM(BlueprintType)
 enum class ECombatKnockbackDirection : uint8
@@ -60,6 +61,21 @@ public:
 	/** Camera shake intensity after a confirmed hit. Zero disables the shake for this window. */
 	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback", meta = (ClampMin = "0.0", ClampMax = "2.0"))
 	float CameraShakeScale = 0.35f;
+
+	/** Optional Niagara effect spawned only after ApplyDamageToTarget confirms real HP loss. */
+	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback")
+	TObjectPtr<UNiagaraSystem> ConfirmedHitVFX;
+
+	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback", meta = (ClampMin = "0.01"))
+	float ConfirmedHitVFXScale = 1.f;
+
+	/** Starts the short E4/S7 finisher camera after the first confirmed hit in this window. */
+	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback")
+	bool bStartFinisherCinematic = false;
+
+	/** Optional one-shot VFX placed at the attacker's feet when the finisher starts. */
+	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback")
+	TObjectPtr<UNiagaraSystem> FinisherVFX;
 
 	/** Optional stamina cost paid when this authored hit window starts (E uses 12.5 x 4). */
 	UPROPERTY(EditAnywhere, Category = "Hitbox|Stamina", meta = (ClampMin = "0.0"))
