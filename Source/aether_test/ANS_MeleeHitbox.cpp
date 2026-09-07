@@ -3,9 +3,11 @@
 #include "Animation/AnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "Kismet/GameplayStatics.h"
 #include "Engine/EngineTypes.h"
 #include "NiagaraFunctionLibrary.h"
 #include "NiagaraSystem.h"
+#include "Particles/ParticleSystem.h"
 
 FVector UANS_MeleeHitbox::GetHitboxLocation(const USkeletalMeshComponent* MeshComp) const
 {
@@ -111,7 +113,12 @@ void UANS_MeleeHitbox::NotifyTick(USkeletalMeshComponent* MeshComp, UAnimSequenc
 			continue;
 		}
 
-		if (ConfirmedHitVFX)
+		const bool bHasUnifiedVFXEntries = ConfirmedHitVFXEntries.Num() > 0;
+		const bool bHasLegacyVFXList = ConfirmedHitParticleVFXList.Num() > 0
+			|| ConfirmedHitVFXList.Num() > 0;
+		const bool bHasLegacyVFXData = bHasLegacyVFXList
+			|| ConfirmedHitParticleVFX || ConfirmedHitVFX;
+		if (bHasUnifiedVFXEntries || bHasLegacyVFXData)
 		{
 			FVector ImpactLocation = Hit.ImpactPoint;
 			if (ImpactLocation.IsNearlyZero())
@@ -133,15 +140,82 @@ void UANS_MeleeHitbox::NotifyTick(USkeletalMeshComponent* MeshComp, UAnimSequenc
 				ImpactNormal = FVector::UpVector;
 			}
 
-			UNiagaraFunctionLibrary::SpawnSystemAtLocation(
-				MeshComp, ConfirmedHitVFX, ImpactLocation,
-				FRotationMatrix::MakeFromZ(ImpactNormal).Rotator(),
-				FVector(FMath::Max(0.01f, ConfirmedHitVFXScale)), true, true);
-		}
+			const float GlobalVFXScale = FMath::Max(0.01f, ConfirmedHitVFXScale);
+			const FVector LegacyVFXScale(GlobalVFXScale);
+			const FRotator HitNormalRotation = FRotationMatrix::MakeFromZ(ImpactNormal).Rotator();
+			auto SpawnParticleVFX = [&](UParticleSystem* Effect, const FVector& Location,
+				const FRotator& Rotation, const FVector& Scale)
+			{
+				if (!Effect)
+				{
+					return;
+				}
+				UGameplayStatics::SpawnEmitterAtLocation(
+					MeshComp, Effect, Location, Rotation,
+					Scale, true, EPSCPoolMethod::AutoRelease, true);
+			};
+			auto SpawnNiagaraVFX = [&](UNiagaraSystem* Effect, const FVector& Location,
+				const FRotator& Rotation, const FVector& Scale)
+			{
+				if (!Effect)
+				{
+					return;
+				}
+				UNiagaraFunctionLibrary::SpawnSystemAtLocation(
+					MeshComp, Effect, Location, Rotation,
+					Scale, true, true);
+			};
 
-		if (bStartFinisherCinematic && Attacker->IsPlayerControlled())
-		{
-			Attacker->BeginFinisherCinematic(Victim, FinisherVFX);
+			if (bHasUnifiedVFXEntries)
+			{
+				for (const FConfirmedHitVFXEntry& Entry : ConfirmedHitVFXEntries)
+				{
+					UFXSystemAsset* EffectAsset = Entry.Effect.Get();
+					if (!EffectAsset)
+					{
+						continue;
+					}
+
+					const FRotator BaseRotation = Entry.bAlignToHitNormal
+						? HitNormalRotation
+						: FRotator::ZeroRotator;
+					const FQuat BaseQuaternion = BaseRotation.Quaternion();
+					const FVector EntryLocation = ImpactLocation + BaseQuaternion.RotateVector(Entry.LocationOffset);
+					const FRotator EntryRotation =
+						(BaseQuaternion * Entry.RotationOffset.Quaternion()).Rotator();
+					const FVector EntryScale(
+						FMath::Max(0.01f, Entry.Scale.X),
+						FMath::Max(0.01f, Entry.Scale.Y),
+						FMath::Max(0.01f, Entry.Scale.Z));
+					if (UNiagaraSystem* NiagaraEffect = Cast<UNiagaraSystem>(EffectAsset))
+					{
+						SpawnNiagaraVFX(NiagaraEffect, EntryLocation, EntryRotation, EntryScale);
+					}
+					else if (UParticleSystem* ParticleEffect = Cast<UParticleSystem>(EffectAsset))
+					{
+						SpawnParticleVFX(ParticleEffect, EntryLocation, EntryRotation, EntryScale);
+					}
+				}
+			}
+			else if (bHasLegacyVFXList)
+			{
+				for (const TObjectPtr<UParticleSystem>& Effect : ConfirmedHitParticleVFXList)
+				{
+					SpawnParticleVFX(Effect.Get(), ImpactLocation, HitNormalRotation, LegacyVFXScale);
+				}
+				for (const TObjectPtr<UNiagaraSystem>& Effect : ConfirmedHitVFXList)
+				{
+					SpawnNiagaraVFX(Effect.Get(), ImpactLocation, HitNormalRotation, LegacyVFXScale);
+				}
+			}
+			else if (ConfirmedHitParticleVFX)
+			{
+				SpawnParticleVFX(ConfirmedHitParticleVFX, ImpactLocation, HitNormalRotation, LegacyVFXScale);
+			}
+			else
+			{
+				SpawnNiagaraVFX(ConfirmedHitVFX, ImpactLocation, HitNormalRotation, LegacyVFXScale);
+			}
 		}
 
 		Attacker->PlayCombatCameraShake(CameraShakeScale);

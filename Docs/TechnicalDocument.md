@@ -1,102 +1,349 @@
 # Technical Document — Hack & Slash Combat Prototype
 
-**Project:** aether_test · **Engine:** Unreal Engine 5.4.4 · **Status:** Combat core v1 (ground combo chain complete; GAS layer in progress)
-**Author:** Nguyen Nguyen · August 2026
-
----
+**Project:** `aether_test`
+**Engine:** Unreal Engine 5.4.4
+**Target:** Windows PC
+**Status:** Combat prototype complete for Game Combat Engineer Test 1
+**Author:** Nguyen Nguyen
 
 ## 1. Overview
 
-A third-person hack-and-slash prototype focused on montage-driven melee combos, built on the ThirdPerson template with the free RamsterZ bare-handed animation set (retargeted UE4 Mannequin → UE5 Manny via IK Retargeter).
+This prototype is a third-person hack-and-slash combat slice built on Unreal Engine's Third Person template. It demonstrates montage-driven melee combat, data-authored combo branches, Gameplay Ability System attributes/effects, enemy wave progression, dynamic camera feedback, HUD presentation, and animation-timed VFX.
 
-Current deliverable: the **complete melee moveset** — a 4-hit ground chain (LMB), a 4-hit skill chain (E), a launcher (RMB) usable both standalone and as a mid-chain link, and a **root-motion air chain** reachable from any point of a combo while airborne. Full combo grammar: `ground ×4 → launcher → skill ×4` or `ground ×4 → launcher → jump → air dive`. Flavor-aware input buffering, impact-timed chain windows, root-motion drive, and movement lock during attacks. The architecture makes each move a *data extension*, not new logic.
+The combat rules are split between native C++ systems that need gameplay authority and Blueprint/animation data that is faster to tune. A new attack is normally created by adding an animation montage and configuring its notify window; the trace, damage, stamina, combo, VFX, and feedback code is reused.
 
-## 2. Architecture
+## 2. Feature coverage
+
+| Requirement | Implementation |
+|---|---|
+| Montage melee combat | One independent `AnimMontage` per authored attack |
+| 5+ attack combinations | Ground chain, skill chain, launcher link, air dive, and cross-lane branches |
+| Ground combo | `AM_Ground_A1` → `A2` → `A3` → `A4` |
+| Skill combo | `AM_Skill_S4` → `S5` → `S6` → `S7` |
+| Air combat | `AM_Dive_D3`, selected whenever attack input is routed while falling |
+| GAS attributes | `UCombatAttributeSet`: Health, MaxHealth, Stamina, MaxStamina |
+| Gameplay Effects | Damage, stamina cost, stamina regeneration, poison DoT |
+| Gameplay Cue | `GC_Poison` provides the poison visual indicator |
+| Dynamic camera | SpringArm lag, combat framing, target-aware arm/FOV, hit shake, S7 orbit |
+| HUD | Native UMG for HP, stamina, E readiness, combo streak, enemy HP bars |
+| Enemy/wave loop | Event-driven `ACombatWaveSpawner`, three configured waves |
+| Test iteration | Press `R` after the final wave to reset and start wave 1 again |
+
+## 3. Controls and demo flow
+
+| Input | Action |
+|---|---|
+| `WASD` | Move |
+| Mouse movement | Camera look |
+| `LMB` | Ground attack / continue ground chain |
+| `E` | Skill chain / switch into the skill lane during a window |
+| `RMB` | Launcher `L2`, usable from idle or an open combo window |
+| `Space` | Jump; attack while airborne routes to the air dive |
+| `R` | Reset the completed three-wave run and restart from wave 1 |
+
+Suggested video order:
+
+1. Show the HUD and the three enemy waves.
+2. Demonstrate the four-hit ground chain with `LMB`.
+3. Demonstrate `RMB` launcher, then `E` to continue into `S4–S7`.
+4. Demonstrate jump/airborne routing into `D3`.
+5. Show a confirmed hit: HP loss, combo increase, hit VFX and camera shake.
+6. Let the final wave finish, press `R`, and show wave 1 spawning again without leaving the level.
+
+## 4. Combo grammar
+
+The shipped moveset is a small state machine rather than a fixed animation movie. `LMB`, `E`, and `RMB` select or switch lanes only during an authored combo window. A press that arrives slightly early is stored in `BufferedInput` and consumed when the next window opens.
 
 ```mermaid
 flowchart LR
-  subgraph Input
-    IA[Enhanced Input<br/>IA_Attack - LMB<br/>IA_Skill - E]
-  end
-  subgraph Character[BP_ThirdPersonCharacter]
-    ST{{"State: bIsAttacking, bComboWindowOpen,<br/>BufferedInput (none/attack/skill),<br/>ComboIndex, bInSkillCombo"}}
-    ARR[("CurrentCombo ← GroundCombo A1..A4<br/>or SkillCombo S1..Sn<br/>TArray&lt;AnimMontage&gt;")]
-    EV[StartCombo / AdvanceGround / AdvanceSkill /<br/>OpenComboWindow / CloseComboWindow /<br/>ResetCombo]
-  end
-  subgraph Animation
-    M1[Per-attack montages<br/>trimmed from combo string clips]
-    NS[ANS_ComboWindow<br/>AnimNotifyState]
-  end
-  IA --> EV
-  EV -->|Play Montage array index| M1
-  M1 -->|NotifyBegin / NotifyEnd| NS
-  NS -->|Open / CloseComboWindow| EV
-  M1 -->|On Completed only| EV
-  ARR --> EV
+    I[Idle]
+    G1[Ground A1\nAM_Ground_A1]
+    G2[Ground A2\nAM_Ground_A2]
+    G3[Ground A3\nAM_Ground_A3]
+    G4[Ground A4\nAM_Ground_A4]
+    L2[Launcher L2\nAM_Launcher_L2]
+    S4[Skill S4\nAM_Skill_S4]
+    S5[Skill S5\nAM_Skill_S5]
+    S6[Skill S6\nAM_Skill_S6]
+    S7[Skill S7\nAM_Skill_S7]
+    D3[Air Dive D3\nAM_Dive_D3]
+    End[Return to locomotion]
+
+    I -->|LMB| G1
+    G1 -->|LMB: window or buffer| G2
+    G2 -->|LMB: window or buffer| G3
+    G3 -->|LMB: window or buffer| G4
+    G4 -->|LMB: window or buffer| G1
+
+    I -->|E, full skill budget available| S4
+    G1 -->|E during window| S4
+    G2 -->|E during window| S4
+    G3 -->|E during window| S4
+    G4 -->|E during window| S4
+    S4 -->|E: window or buffer| S5
+    S5 -->|E: window or buffer| S6
+    S6 -->|E: window or buffer| S7
+    S7 -->|Completed| End
+
+    I -->|RMB| L2
+    G1 -->|RMB during window| L2
+    G2 -->|RMB during window| L2
+    G3 -->|RMB during window| L2
+    G4 -->|RMB during window| L2
+    S4 -->|RMB during window| L2
+    S5 -->|RMB during window| L2
+    S6 -->|RMB during window| L2
+    L2 -->|E during window| S4
+    L2 -->|Jump, then LMB while falling| D3
+
+    G1 -->|LMB while falling| D3
+    G2 -->|LMB while falling| D3
+    G3 -->|LMB while falling| D3
+    G4 -->|LMB while falling| D3
+    S4 -->|LMB while falling| D3
+    S5 -->|LMB while falling| D3
+    S6 -->|LMB while falling| D3
+    D3 -->|Completed| End
+    G4 -->|Completed| End
 ```
 
-**Flow:** each attack key either starts its lane (`StartCombo` with the matching montage array, or `DoLauncher`/`DoAirDive` for the single-move lanes), advances/switches lanes if the chain window is open (`AdvanceGround` / `AdvanceSkill` / `DoLauncher`), or is **buffered by key** (`BufferedInput`: none/attack/skill/launcher) and auto-consumed the moment the window opens. Each montage carries one `ANS_ComboWindow` notify-state strip that opens/closes the window by calling back into the character. `On Completed` of the final montage resets all state; `On Interrupted` is deliberately unhandled — the next attack interrupting the previous one *is* the chain mechanism.
+### 4.1 Why one montage per attack
 
-**Aerial rules:** the launcher montage fires a `Launch` anim-notify (**branching-point** tick type — queued notifies were measured to drop intermittently) that `LaunchCharacter`s the character upward. Air attacks are **pure root-motion montages**: any attack input that arrives while airborne routes to the air chain — whether starting fresh (idle → falling) or **mid-combo** (`AdvanceGround` checks `IsFalling` before its lane logic and lane-switches to the air array). No gravity manipulation and no physics impulses beyond the launcher pop; landing mid-move simply lets the move finish, and state resets only on montage completion.
+The source animation pack contains combo-string clips. An early implementation used montage sections and `Montage_JumpToSection`, but that produced hard cuts when switching between source clips. The final implementation trims the authored clips into independent montages and plays the next asset with normal montage blending.
 
-## 3. Key design decisions
-
-### 3.1 Two combo architectures were built and compared
-
-The animation source is a **combo string** (one clip containing 4 consecutive punches), which allows two implementations:
-
-| | **A — One montage + sections** (built first) | **B — One montage per attack** (shipped) |
-|---|---|---|
-| Chaining | `Montage_JumpToSection` — instant cut, no blending | `Montage_Play` next asset — natural crossfade (0.1s in / 0.15s out) |
-| Asset prep | Sections cut inside the clip, section auto-links cleared | Clip trimmed into per-attack montages via segment Start/End time |
-| Logic | Needs section names, link clearing, jump management | Plain montage array + index; no section handling at all |
-| Extensibility | Awkward across multiple source clips; branching is hacky | Chain = editable array; branches/launcher/air = other arrays |
-| Observed feel | Visible pops on early chains; hard seam between different source clips | Smooth transitions at any input timing |
-
-Approach A works and preserves the animator's authored flow, but play-testing showed hard cuts when chaining early and no way to blend across source clips. Approach B was adopted: **each attack is an independent montage trimmed from the string** (e.g. A2 = 0.43s→0.73s of the source clip), chained by playing the next asset. Montage blending then provides transition smoothing for free, and the combo definition becomes pure data.
-
-### 3.2 Chain windows are anchored to measured impact frames
-
-Instead of eyeballing, impact timings were extracted by **sampling hand-bone extension per frame** (editor Python, `AnimPoseExtensions`): fist-to-pelvis distance peaks at frames 10 / 16 / 28 / 42 → those are the contact frames. Each chain window opens **at contact** and stays open to the end of that attack. Combined with input buffering (early presses fire exactly when the window opens), this guarantees every punch is shown through its contact frame while staying fully responsive to button mashing.
-
-### 3.3 Montage callback lifecycle
-
-With per-attack montages, interruption is the normal chaining path. Rule: **`On Completed` → reset combat state; `On Interrupted` / `On Blend Out` → intentionally ignored.** (Binding reset to `On Interrupted` makes the combo cancel itself on every chain; binding it to `On Blend Out` fires at blend *start* and was measured to cut the effective chain window by 0.15s.)
-
-### 3.4 Genre-standard locomotion rules
-
-- **Root motion from montages**: attacks physically drive the capsule forward (enabled on the combat AnimSequences; ABP already set to *Root Motion from Montages Only*), eliminating the mesh-snap-back artifact of visual-only root translation.
-- **Movement lock while attacking**: `MaxWalkSpeed` 0 on combo start, restored on reset — no foot-sliding while attacking, per hack-and-slash convention (movement during attacks comes from root motion only).
-
-### 3.5 Dual-chain input: chain switching + flavor-aware buffering
-
-The two chains (LMB ground, E skill) share one state machine. Pressing the *other* key mid-chain switches `CurrentCombo` and restarts the new chain from its first move (`ComboIndex = -1` before advancing) — evaluated per press inside the chain window. An earlier iteration shared the combo index across chains (sensible while both chains used near-identical animations); once the skill chain received its own move set, that was replaced by the reset-on-switch rule.
-
-The input buffer records **which key** was pressed (`BufferedInput`: none / attack / skill), not just that something was pressed. This is what makes finisher-chaining reliable: spamming E around the last ground hit always enters the skill chain the instant that hit's window opens, instead of dying on an index overflow. Known remaining polish: the visual seam between the ground finisher pose and the skill opener is acceptable but not perfect — being tuned via per-montage blend-in times and segment cut points.
-
-### 3.6 Aerial design: a physics prototype, measured, then deliberately cut
-
-Two aerial designs were built. The first was physics-driven: a launcher flag gating a low-gravity juggle state (GravityScale 0.3), plus a free-fall dive steered by launch impulses (forward ×500, down −800) on a root-motion-disabled clip. It worked, but frame-by-frame state tracing showed a web of lifecycle edge cases — gravity restores racing montage lifetimes, landing resets cutting animations short, clip root-translation artifacts — that kept generating regressions. It was rolled back wholesale (git made that a one-command decision) in favor of the shipped design: **air attacks are ordinary root-motion montages in the same lane machinery**, selected by a single `IsFalling` check at input-routing time. One branch of logic replaced four interacting subsystems, at the cost of the juggle's floaty height control — an acceptable trade for this project's scope.
-
-The launcher matured into a **mid-chain link**: it carries its own chain window, so a ground string can flow through it into the skill string (`…A4 → launcher → S1…`), or the player can jump during it and convert into the air dive. Promoting it into the shared window/buffer system (with its own buffer slot) is what removed the one-beat stall the first implementation had.
-
-## 4. Tooling note
-
-The editor was driven partly through the Remote Control API (HTTP + Python): batch property edits (blend times, root motion flags), remote Blueprint compilation checks, per-frame PIE state tracing to diagnose the blend-out/window interaction, and the bone-sampling measurement in §3.2. All timing values in this document come from those measurements rather than estimation.
-
-Blueprint graphs were additionally audited as text: UE's node clipboard format (Ctrl+A/Ctrl+C in a graph) is a complete T3D description of nodes, pins and links, which was exported and machine-checked against the intended design — catching an unlinked mesh pin, an orphaned node and a truncated reset chain that visual inspection had missed.
-
-## 5. Roadmap to full test scope
-
-| Requirement | Plan |
+| Decision | Shipped approach |
 |---|---|
-| 5+ attack combinations, ground 3+ / air 2+ | **Done (7+):** ground 4-hit chain, skill 4-hit chain, lane branches both directions, launcher, mega-chain ground→launcher→skill, ground→launcher→jump→air chain, air chain from a plain jump |
-| GAS: HP/Stamina + effects | C++ `UCombatAttributeSet` (Health/Stamina) + ASC on a shared character base; combo moves into a GameplayAbility; stamina cost via Cost GE; poison DoT as periodic GE with GameplayCue visual |
-| Dynamic camera | SpringArm lag + combat-aware arm length/FOV interp + hit camera shake (collision test built-in) |
-| HUD | UMG bound to attribute-change delegates; combo counter driven by hit events |
-| Enemies | Same character base (inherits health/poison for free), simple chase-and-attack AI, wave spawner |
+| Asset unit | One montage per attack |
+| Chain selection | `TArray<AnimMontage>` plus `ComboIndex` |
+| Transition | Montage blend, approximately `0.1s` in / `0.15s` out |
+| Timing | `ANS_ComboWindow` around the measured contact frame |
+| Extending a chain | Add an asset to the appropriate array and author its notify window |
 
-## 6. How to run
+This makes the combo definition data-driven. The combat resolver does not need a new C++ branch for every attack.
 
-1. Unreal Engine 5.4.4, open `aether_test.uproject`, press Play.
-2. **LMB** — ground combo chain (4 hits); while airborne — air attack chain (works mid-combo too). **E** — skill combo chain; press mid-chain to branch either way, or right after the launcher to continue the mega-chain. **RMB** — launcher kick (chainable mid-combo; jump during it to convert into the air dive). All mash-friendly (per-key input buffering). Movement: WASD + Space.
+### 4.2 Input state and buffering
+
+```mermaid
+flowchart TD
+    Input[IA_Attack / IA_Skill / IA_Launcher]
+    State{Is attacking?}
+    Window{Combo window open?}
+    Falling{Is falling?}
+    Start[Start selected lane]
+    Advance[Advance current lane]
+    Switch[Switch lane, set index to -1]
+    Buffer[Store key in BufferedInput]
+    Notify[ANS_ComboWindow opens]
+    Consume[Switch on BufferedInput and consume it]
+    Complete[Montage Completed]
+    Reset[ResetCombo and restore locomotion]
+
+    Input --> State
+    State -->|No| Start
+    State -->|Yes| Window
+    Window -->|No| Buffer
+    Window -->|Yes| Falling
+    Falling -->|Yes and attack input| Switch
+    Falling -->|No| Advance
+    Start -->|Play montage| Notify
+    Advance -->|Same lane| Notify
+    Switch -->|New lane, index -1| Notify
+    Notify --> Consume
+    Consume -->|No buffered input| Complete
+    Consume -->|Buffered input| Advance
+    Complete --> Reset
+```
+
+The buffer stores the key, not only a Boolean. `BufferedInput` uses `0 = none`, `1 = attack`, `2 = skill`, and `3 = launcher`. This prevents an early `E` from accidentally advancing the ground array after a ground finisher.
+
+`On Completed` is the normal cleanup path. `On Interrupted` and `On Blend Out` are intentionally not wired to reset the combo because playing the next montage is itself the normal interruption path for a chain.
+
+### 4.3 Air design
+
+The final air design uses root motion from the attack montages. A single `IsFalling` decision in `AdvanceGround` routes attack input to the air lane, including input received in the middle of a ground or skill sequence. This removed the earlier low-gravity/impulse prototype and its gravity-restore edge cases.
+
+The launcher remains the intentional vertical entry point and applies a `650uu` vertical launch on confirmed hit. It is also a normal combo-window participant, so `L2 → E` and `L2 → jump → air attack` are both authored routes.
+
+## 5. Authoritative combat and GAS flow
+
+```mermaid
+flowchart LR
+    Montage[Attack montage]
+    Window[ANS_MeleeHitbox\nNotifyBegin / Tick / End]
+    Sweep[Socket sphere sweep\nper-frame movement]
+    Dedupe[HitActors per notify activation]
+    Gate[ApplyDamageToTarget]
+    GE[GE_Damage\nSetByCaller Data.Damage]
+    HP{Target HP decreased?}
+    Confirmed[Confirmed hit]
+    Miss[Miss / rejected hit]
+    Combo[RegisterConfirmedHit\nplayer only]
+    VFX[Confirmed Hit VFX Entries\nimpact point + normal]
+    Feedback[Camera shake / reaction]
+    Secondary[Poison, stamina gain,\nlaunch or knockback]
+
+    Montage --> Window --> Sweep --> Dedupe --> Gate
+    Gate --> GE --> HP
+    HP -->|No| Miss
+    HP -->|Yes| Confirmed
+    Confirmed --> Combo
+    Confirmed --> VFX
+    Confirmed --> Feedback
+    Confirmed --> Secondary
+```
+
+`UANS_MeleeHitbox` is animation-timed, but it is not the authority for whether damage happened. `ACombatCharacterBase::ApplyDamageToTarget()` applies `GE_Damage`, compares target HP before and after, and returns `true` only when the target really lost HP. Poison, launch, hit reaction, camera shake, VFX and combo accounting are downstream of that result.
+
+The per-window `HitActors` set prevents repeated notify ticks from damaging the same victim continuously. A later authored notify window may hit the same victim again, which is how deliberate multi-hit attacks remain possible.
+
+## 6. GAS attributes and effects
+
+```mermaid
+flowchart TD
+    Character[ACombatCharacterBase\nplayer and enemy]
+    ASC[AbilitySystemComponent]
+    Attr[UCombatAttributeSet\nHealth / MaxHealth\nStamina / MaxStamina]
+    Damage[GE_Damage]
+    Cost[GE_StaminaCost]
+    Regen[GE_StaminaRegen]
+    Poison[GE_PoisonDoT]
+    Cue[GC_Poison\nvisual cue]
+    HUD[CombatPlayerHUDWidget]
+
+    Character --> ASC
+    Character --> Attr
+    ASC --> Attr
+    Damage -->|negative Data.Damage| Attr
+    Cost -->|negative Data.StaminaCost| Attr
+    Regen -->|periodic restore| Attr
+    Poison -->|periodic Health damage| Attr
+    Poison --> Cue
+    Attr -->|delegates| HUD
+```
+
+Key rules:
+
+- Native defaults are `Health = 100`, `MaxHealth = 100`, `Stamina = 100`, `MaxStamina = 100`; attributes are clamped to valid ranges.
+- The player starts at `50%` stamina so the E budget is visible in the demo.
+- One complete four-hit E chain has a `50` stamina budget, split into four `12.5` payments at the authored S4–S7 hit windows. S4 owns the full-budget gate; later windows own their individual payments.
+- Normal confirmed player hits can restore configured stamina, bounded by `MaxStamina`; E windows do not refund stamina.
+- Poison is applied only after a confirmed enemy hit. The configured DoT is periodic and uses refresh-not-add stacking.
+
+## 7. VFX, camera and HUD separation
+
+### VFX contract
+
+```mermaid
+flowchart TD
+    Attack[Attack montage]
+    Trail[UANS_TimedNiagaraEffect\nattached to hand_r\nNS_ECombo_ElectricTrail]
+    Hitbox[UANS_MeleeHitbox]
+    Result{ApplyDamageToTarget == true?}
+    Impact[Confirmed Hit VFX Entries\nEffect / Offset / Rotation / Scale]
+
+    Attack --> Trail
+    Attack --> Hitbox
+    Hitbox --> Result
+    Result -->|Yes| Impact
+    Result -->|No| None[No impact VFX]
+```
+
+Action VFX and confirmed-hit VFX are intentionally different:
+
+- A trail describes the attack and may play on a whiff. The electric E trail is attached to `hand_r` for the S4–S7 montages and owns its own socket transform and lifetime.
+- A confirmed impact represents gameplay truth. `Confirmed Hit VFX Entries` is the single visible hitbox list; each entry has an effect, location offset, rotation offset, scale and optional hit-normal alignment.
+- Confirmed impact effects spawn at `FHitResult::ImpactPoint`, use the hit normal for orientation, and are deduplicated per victim per notify window.
+- The old single-slot/list fields remain hidden only for serialized backward compatibility. When unified entries exist, they are the active path.
+
+### Camera and presentation
+
+`ACombatCharacterBase` keeps the existing Blueprint SpringArm and Camera components. Native code adds combat-aware arm/FOV interpolation, upper-body target offset, translation/rotation lag and local confirmed-hit shake. World collision remains enabled on the SpringArm; combat character primitives ignore the camera channel so enemies do not collapse the arm into the player.
+
+The S7 `FinisherCinematicWindow` notify temporarily owns camera rotation/framing and global time dilation. `EndFinisherCinematic()` restores control rotation, arm length, target offset, FOV and time dilation on notify end, montage change, death or `EndPlay`.
+
+`UCombatPlayerHUDWidget` is event-driven rather than Tick-driven:
+
+```text
+GAS attribute change -> ACombatCharacterBase delegate -> UCombatPlayerHUDWidget
+Health               -> OnHealthChanged              -> HP bar/text
+Stamina              -> OnStaminaChanged             -> stamina bar + E READY
+Confirmed hit        -> OnComboChanged               -> COMBO xN
+```
+
+The combo number is a confirmed-hit streak, not the number of animation clips played. Multi-target windows can therefore add multiple combo points.
+
+## 8. Enemy waves and rapid test iteration
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Wave1: BeginPlay / StartWaves
+    Wave1 --> Wave2: all spawned enemies removed
+    Wave2 --> Wave3: all spawned enemies removed
+    Wave3 --> Complete: final enemy removed
+    Complete --> Wave1: R / ResetWaves
+    Wave1 --> Complete: invalid or empty configuration handled by state checks
+```
+
+`ACombatWaveSpawner` owns wave state and uses delegates rather than polling every frame:
+
+- `OnCharacterDied` is the primary logical completion signal.
+- `OnDestroyed` is a deduplicated fallback for external removal.
+- `ActiveEnemies` tracks only live spawned actors.
+- `DelayBetweenWaves` defaults to `2.5s`.
+- `HasCompletedAllWaves()` becomes true after the final wave is clear, including the short final delay.
+- `ResetWaves()` clears timers, unregisters callbacks, removes/destroys active enemies, resets the index/state, and calls `StartWaves()`.
+- The existing `IA_Reset` action is bound to native `SetupPlayerInputComponent`; `R` is ignored while a run is still active.
+
+## 9. OOP, SOLID and design patterns
+
+```mermaid
+flowchart TB
+    Input[Enhanced Input]
+    Player[ACombatCharacterBase\ncombat facade/orchestrator]
+    Hitbox[UANS_MeleeHitbox\ntrace adapter]
+    Niagara[UANS_TimedNiagaraEffect\nVFX adapter]
+    Cinematic[UANS_FinisherCinematic\ncamera adapter]
+    GAS[ASC + UCombatAttributeSet\nGameplayEffects]
+    HUD[UCombatPlayerHUDWidget\npresentation]
+    Waves[ACombatWaveSpawner\nwave lifecycle]
+    Data[Montages / notify data / VFX entries]
+
+    Input --> Player
+    Data --> Hitbox
+    Data --> Niagara
+    Data --> Cinematic
+    Player --> GAS
+    Hitbox --> Player
+    Niagara --> Player
+    Cinematic --> Player
+    Player --> HUD
+    Player --> Waves
+    GAS --> HUD
+```
+
+| Principle/pattern | Application |
+|---|---|
+| Single Responsibility | Attributes, hit windows, VFX attachment, cinematic window, HUD and wave lifecycle have separate owners. The character is a bounded combat facade for this single-player test. |
+| Open/Closed | New moves are added through montage arrays and notify data; the damage resolver is not copied per attack. |
+| Liskov Substitution | Player and enemy Blueprint children share `ACombatCharacterBase` for GAS, damage, death and hit reactions. |
+| Interface Segregation | Consumers use small delegates (`OnHealthChanged`, `OnStaminaChanged`, `OnComboChanged`, `OnCharacterDied`) instead of polling the entire actor. |
+| Dependency Inversion | Damage/effect authority is routed through GAS and the character contract; presentation reacts to events. |
+| Adapter | Animation notify/state classes translate timeline callbacks into traces, Niagara attachment and camera behavior. |
+| Observer | GAS changes and character death broadcast to HUD and wave systems. |
+| Data-driven Strategy | Montage arrays, notify properties, VFX entries and GameplayEffects select attack behavior without a class per move. |
+| State machine | Combo lane/window/buffer state and wave progression have explicit transitions and cleanup paths. |
+
+The project intentionally does not introduce a generic combat framework or factory hierarchy for a single playable character. If the prototype grows to multiple combat archetypes, multiplayer ownership or several independent consumers, the safe next refactor is to extract focused `UActorComponent`s behind the existing character API.
+
+## 10. Verification and scope
+
+Verified on UE 5.4.4:
+
+- `aether_test` game target: UHT, compile and link pass.
+- `aether_testEditor` target: UHT, compile and link pass.
+- PIE runtime: ground/skill hit confirmation, wave progression, HUD initialization, camera/VFX smoke paths and `R` wave reset were exercised.
+- Reset test: final wave reported complete (`CurrentWaveIndex = 3` after completion); pressing `R` logged a reset and restarted wave 1. Pressing `R` before completion was ignored.
+- Recent PIE log scan contained no new `LogTemp: Error`, Blueprint, Niagara or Material errors for the tested flow.
+
+Perfect dodge is intentionally outside this Test 1 submission scope; it belongs to the separate Test 2 requirement. The packaged executable and this document are the hand-off artifacts for the recruitment submission.

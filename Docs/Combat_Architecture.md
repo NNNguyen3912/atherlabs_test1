@@ -1,273 +1,381 @@
-# Combat Architecture and Combo Accounting
+# Combat Architecture — Runtime Ownership and Extension Guide
 
 **Project:** `aether_test`
 **Engine:** Unreal Engine 5.4.4
-**Scope:** runtime combat flow, hit confirmation, combo HUD semantics, stamina/E chain, enemy damage effects, and QA guidance
-**Status:** architecture audit of the current implementation; no combat behavior change in this document pass
+**Purpose:** source-level explanation of the combat prototype submitted for Game Combat Engineer Test 1
+**Current scope:** combo combat, confirmed damage, GAS, VFX, camera, HUD, enemies and wave reset
 
-## 1. Purpose
+## 1. Architectural goals
 
-This document describes the combat slice as it exists in the checkout. It is intended to answer two practical questions:
+The prototype uses the narrowest practical split for a single-player Unreal test:
 
-1. What is the authoritative path from an animation notify to damage, effects, stamina, and HUD?
-2. What exactly does the number shown as `COMBO xN` count?
+1. Animation owns timing and authored move data.
+2. Native C++ owns rules that must be consistent across player and enemy paths.
+3. GAS owns attribute/effect application.
+4. Event delegates connect gameplay state to HUD and wave progression.
+5. Cosmetic action feedback is kept separate from confirmed gameplay feedback.
 
-The most important conclusion is that the current HUD number is a **confirmed-hit streak**, not a count of authored attack animations. It is incremented once for each attacker-to-victim hit that causes a real HP decrease. Multi-target hitboxes and multi-window attacks therefore produce more than one combo point from a single named attack.
+The result is a data-driven combat slice without a speculative framework. Adding an attack should mostly mean adding or editing a montage and its notify properties.
 
-## 2. Runtime ownership
+## 2. Runtime ownership map
 
-The implementation deliberately keeps ownership small and explicit:
-
-| Responsibility | Owner | Source / asset |
+| Responsibility | Owner | Public contract |
 |---|---|---|
-| Health, stamina, ASC, damage gate, combo streak, HUD creation | `ACombatCharacterBase` | `Source/aether_test/CombatCharacterBase.h/.cpp` |
-| Animation-timed traces and per-window hit dedupe | `UANS_MeleeHitbox` | `Source/aether_test/ANS_MeleeHitbox.h/.cpp` |
-| Combo input buffering and montage selection | Existing player Blueprint | `Content/ThirdPerson/Blueprints/BP_ThirdPersonCharacter.uasset` |
-| Enemy chase/attack branch and reaction priority | Enemy Blueprint | `Content/Game/Combat/GAS/BP_Enemy.uasset` |
-| Player HUD layout and event binding | `UCombatPlayerHUDWidget` | `Source/aether_test/CombatPlayerHUDWidget.h/.cpp` |
-| Attribute/effect math | Gameplay Ability System | `Content/Game/Combat/GAS/*`, C++ ASC/AttributeSet |
+| ASC, attributes, damage authority, stamina helpers, combo streak, camera and cleanup | `ACombatCharacterBase` | `ApplyDamageToTarget`, `TryPayStamina`, delegates, camera API |
+| Health/max health/stamina/max stamina and clamping | `UCombatAttributeSet` | GAS attributes and accessors |
+| Authored melee window, socket sweep, per-window dedupe | `UANS_MeleeHitbox` | `NotifyBegin`, `NotifyTick`, `NotifyEnd` |
+| Combo lane, montage arrays, buffer and input routing | `BP_ThirdPersonCharacter` | `StartCombo`, `AdvanceGround`, `AdvanceSkill`, `DoLauncher`, air route |
+| Timed socket-following trail | `UANS_TimedNiagaraEffect` | `Template`, `SocketName`, offsets, scale, cleanup |
+| S7 cinematic window | `UANS_FinisherCinematic` | `FFinisherCinematicSettings` → character camera API |
+| Enemy chase/attack presentation | `BP_Enemy` | Blueprint movement and authored enemy montage |
+| Wave lifecycle | `ACombatWaveSpawner` | `StartWaves`, `ResetWaves`, wave delegates |
+| Screen HUD | `UCombatPlayerHUDWidget` | delegate subscriptions and native UMG layout |
+| Combat camera shake | `UCombatHitCameraShake` | local confirmed-hit feedback |
 
-There is no second combo counter in the hitbox notify and no widget-side polling counter. The player character is the single owner of the streak value.
+```mermaid
+flowchart TB
+    subgraph Authored[Authored data]
+        Inputs[Enhanced Input actions]
+        Montages[Per-attack montages]
+        Windows[ANS_ComboWindow / ANS_MeleeHitbox]
+        Effects[GameplayEffects and GameplayCue]
+        VFXData[Confirmed Hit VFX Entries / Niagara trail settings]
+    end
 
-## 3. Authoritative hit flow
+    subgraph Runtime[Runtime owners]
+        Character[ACombatCharacterBase]
+        GAS[ASC + UCombatAttributeSet]
+        Hitbox[UANS_MeleeHitbox]
+        Trail[UANS_TimedNiagaraEffect]
+        Cinematic[UANS_FinisherCinematic]
+        Spawner[ACombatWaveSpawner]
+        HUD[UCombatPlayerHUDWidget]
+    end
 
-```text
-Montage plays
-    |
-    +-- ANS_MeleeHitbox::NotifyBegin
-    |       - validates attacker/cooldown
-    |       - validates player stamina gate/cost for this window
-    |       - creates state and clears HitActors
-    |
-    +-- ANS_MeleeHitbox::NotifyTick (each frame in the authored window)
-            - sweeps the hitbox socket from previous to current position
-            - filters self, invalid actors, and target-type restrictions
-            - skips an actor already hit by this notify activation
-            - calls Attacker->ApplyDamageToTarget(Victim, Damage, ...)
-                    |
-                    +-- applies the attacker's Damage GameplayEffect
-                    +-- compares target HP before/after
-                    +-- returns false when HP did not actually decrease
-                    +-- returns true only for a confirmed damage event
-                            |
-                            +-- player attacker: RegisterConfirmedHit()
-                            +-- optional reaction callback
-                            +-- optional poison/extra effect
-                            +-- optional stamina gain
-                            +-- optional launch/knockback
-
-NotifyEnd
-    - removes the per-mesh hitbox state
+    Inputs --> Character
+    Montages --> Windows
+    Windows --> Hitbox
+    Montages --> Trail
+    Montages --> Cinematic
+    Effects --> GAS
+    VFXData --> Hitbox
+    VFXData --> Trail
+    Character <--> GAS
+    Hitbox --> Character
+    Trail --> Character
+    Cinematic --> Character
+    Character --> HUD
+    Character --> Spawner
+    GAS --> HUD
 ```
 
-`ApplyDamageToTarget()` is the single confirmation gate. Anything that is supposed to represent a successful hit is downstream of this gate. This is why capsule contact, a failed GameplayEffect, a dead target, or a zero-damage configuration must not increment combo or apply poison.
+## 3. Combo state machine
 
-## 4. Exact combo semantics
+### 3.1 Move vocabulary
 
-### 4.1 Increment rule
+| Lane | Moves | Montage assets | Entry |
+|---|---|---|---|
+| Ground | A1–A4 | `AM_Ground_A1` … `AM_Ground_A4` | `LMB` |
+| Launcher | L2 | `AM_Launcher_L2` | `RMB` |
+| Skill | S4–S7 | `AM_Skill_S4` … `AM_Skill_S7` | `E` |
+| Air | D3 | `AM_Dive_D3` | attack input while `IsFalling` |
 
-The increment path is:
+The labels are gameplay vocabulary, not a second runtime type system. The Blueprint keeps the current montage array and index, while native notify code handles timing-sensitive gameplay.
 
-```text
-ApplyDamageToTarget()
-    HP after < HP before
-        -> IsPlayerControlled()
-            -> RegisterConfirmedHit()
-                -> ++ComboCount
-                -> OnComboChanged.Broadcast(ComboCount)
+### 3.2 Complete route diagram
+
+```mermaid
+flowchart LR
+    Idle((Idle))
+    A1[A1]
+    A2[A2]
+    A3[A3]
+    A4[A4]
+    L2[L2 Launcher]
+    S4[S4]
+    S5[S5]
+    S6[S6]
+    S7[S7 Finisher]
+    D3[D3 Air Dive]
+    Locomotion((Locomotion))
+
+    Idle -->|LMB| A1
+    A1 -->|LMB| A2
+    A2 -->|LMB| A3
+    A3 -->|LMB| A4
+    A4 -->|LMB| A1
+
+    Idle -->|E if full budget| S4
+    A1 -->|E in window| S4
+    A2 -->|E in window| S4
+    A3 -->|E in window| S4
+    A4 -->|E in window| S4
+    S4 -->|E| S5
+    S5 -->|E| S6
+    S6 -->|E| S7
+
+    Idle -->|RMB| L2
+    A1 -->|RMB in window| L2
+    A2 -->|RMB in window| L2
+    A3 -->|RMB in window| L2
+    A4 -->|RMB in window| L2
+    S4 -->|RMB in window| L2
+    S5 -->|RMB in window| L2
+    S6 -->|RMB in window| L2
+    L2 -->|E in window| S4
+
+    A1 -->|LMB while falling| D3
+    A2 -->|LMB while falling| D3
+    A3 -->|LMB while falling| D3
+    A4 -->|LMB while falling| D3
+    S4 -->|LMB while falling| D3
+    S5 -->|LMB while falling| D3
+    S6 -->|LMB while falling| D3
+    L2 -->|Jump then LMB while falling| D3
+
+    A4 -->|Completed| Locomotion
+    S7 -->|Completed| Locomotion
+    D3 -->|Completed| Locomotion
 ```
 
-Relevant implementation points:
+### 3.3 State and callback invariants
 
-- `CombatCharacterBase.cpp`: `ApplyDamageToTarget()` calls `RegisterConfirmedHit()` only after the HP-before/after check succeeds.
-- `CombatCharacterBase.cpp`: `RegisterConfirmedHit()` increments the integer and broadcasts `OnComboChanged`.
-- `CombatCharacterBase.h`: `ComboCount` and `OnComboChanged` belong to the character, not to an individual enemy.
-- `CombatPlayerHUDWidget.cpp`: the widget binds to the observed player character's `OnComboChanged` delegate and renders `COMBO x{count}`.
-
-Enemy attacks do not increase the player's combo because the registration call is guarded by `IsPlayerControlled()` on the attacker. A player hit on an enemy does increase the player's counter.
-
-### 4.2 Unit of counting: victim per notify window
-
-`UANS_MeleeHitbox` owns a `FHitboxState` for each active skeletal mesh. At `NotifyBegin`, `State.HitActors` is reset. During that one notify activation, each victim actor can be processed at most once. When the notify ends, the state is removed; a later notify window can hit the same victim again.
-
-Therefore the practical unit is:
+The authored Blueprint state is intentionally small:
 
 ```text
-one player attacker
-× one living victim
-× one authored ANS_MeleeHitbox activation
-× real HP decrease
-= one combo increment
+bIsAttacking
+bIsComboWindowOpen
+bSkillCombo
+bIsAirCombo
+ComboIndex
+CurrentCombo
+BufferedInput       // 0 none, 1 LMB, 2 E, 3 RMB
 ```
 
-This is intentionally different from “one animation montage equals one combo point.” A single notify can hit several enemies, and a single montage can contain several non-overlapping notify windows.
+The key invariants are:
 
-### 4.3 Why `COMBO x21` is consistent with nine named attacks
+- `ANS_ComboWindow` opens and closes the input window; it does not decide damage.
+- Same-lane input advances the current array.
+- Cross-lane input sets the new array and resets `ComboIndex` to `-1` before advancing.
+- Input received outside the window stores its key in `BufferedInput`.
+- `AdvanceGround` checks `IsFalling` before normal ground routing, so airborne input cannot accidentally play a ground montage.
+- `On Completed` reaches `ResetCombo`, which restores movement and clears combat state.
+- `On Interrupted` and `On Blend Out` are intentionally not reset callbacks; the next montage in a chain interrupts the previous montage by design.
 
-If three enemies are inside a hitbox and a window damages all three, that one window contributes three points. A total of 21 means that 21 attacker-to-victim confirmations occurred before the combo timeout; it does not mean that 21 animation montages played.
+The per-attack montage architecture was selected after comparing it with one montage plus sections. Independent montages provide normal blending across different source clips, remove section-name/link management, and let each move carry its own notify data.
 
-For example, seven successful windows hitting all three enemies produce:
+## 4. Confirmed hit pipeline
+
+```mermaid
+sequenceDiagram
+    participant M as Attack Montage
+    participant N as UANS_MeleeHitbox
+    participant T as Socket Sphere Sweep
+    participant C as ACombatCharacterBase
+    participant A as Target ASC
+    participant H as HUD / Camera / VFX
+
+    M->>N: NotifyBegin
+    N->>N: Reset HitActors and cache socket position
+    M->>N: NotifyTick each frame
+    N->>T: Sweep from previous socket to current socket
+    T-->>N: Pawn hit candidates
+    N->>N: Reject self, invalid, filtered or already-hit actors
+    N->>C: ApplyDamageToTarget(victim, Damage)
+    C->>A: Apply GE_Damage with Data.Damage
+    A-->>C: Attribute change
+    alt HP decreased
+        C-->>C: RegisterConfirmedHit for player attacker
+        C-->>H: Broadcast combo/health and play local feedback
+        N-->>H: Spawn confirmed impact VFX at Hit.ImpactPoint
+        N-->>A: Apply poison/secondary effect if authored
+        N-->>C: Apply launch/knockback if authored
+    else No real damage
+        C-->>N: return false
+        N-->>H: No impact VFX, poison, launch or combo point
+    end
+    M->>N: NotifyEnd
+    N->>N: Remove per-mesh state
+```
+
+`ApplyDamageToTarget()` is the single gameplay confirmation gate. It rejects dead actors, missing effect wiring, invalid damage and unchanged HP. This prevents a trace overlap from being mistaken for a hit.
+
+The unit of hit accounting is:
 
 ```text
-7 windows × 3 victims = 21 confirmed hits
+one attacker × one living victim × one active notify window × real HP decrease
+= one confirmed hit
 ```
 
-Other distributions are also valid: some windows may hit one or two enemies, some may whiff, and Dive may contain multiple windows. If all nine authored attacks had exactly one hit window and all three enemies were hit every time, the number would be 27; seeing 21 simply indicates that the actual confirmed target/window distribution was lower than that maximum (or that the streak reset/started partway through the sequence).
+As a consequence, a single window that damages three enemies adds three points to the player's confirmed-hit streak. The HUD value `COMBO xN` is intentionally not the number of montage assets played.
 
-The observed value is therefore expected under the current implementation. It is not evidence that the counter is accidentally incrementing on mere overlap.
+## 5. GAS and resource policy
 
-### 4.4 Reset behavior
+`ACombatCharacterBase` owns an ASC and a shared `UCombatAttributeSet` for both player and enemy. The attribute set initializes and clamps `Health`, `MaxHealth`, `Stamina` and `MaxStamina`.
 
-`RegisterConfirmedHit()` clears and restarts `ComboResetTimer` after every confirmed hit. `ComboResetDelay` is currently two seconds by default. When that timer expires, `ResetCombo()` sets the value to zero and broadcasts the update so the HUD collapses the combo text.
+```mermaid
+flowchart LR
+    Hit[Confirmed melee hit]
+    Damage[GE_Damage\nData.Damage = -Damage]
+    EnemyHP[Target Health]
+    Attack[Player attack window]
+    Cost[GE_StaminaCost\nData.StaminaCost = -Cost]
+    PlayerStamina[Player Stamina]
+    Regen[GE_StaminaRegen\nperiodic restore]
+    Poison[GE_PoisonDoT\nperiodic damage]
+    Cue[GC_Poison]
 
-The counter is a continuous hit streak: spacing attacks less than the reset delay keeps the streak alive; waiting longer starts the next streak at one.
-
-## 5. Multi-hit attacks and target movement
-
-The current design supports the desired game-feel without a second combat framework:
-
-- **Ground attacks:** normally one hitbox activation per authored contact window.
-- **Dive D3:** four short activations; the same enemy may contribute up to four confirmed hits if it remains in the sweep path and survives.
-- **E chain S4–S7:** each montage owns its own window and stamina cost. S6/S7 add horizontal displacement after confirmation; the displacement does not create an extra combo point by itself.
-- **Multiple enemies:** every distinct victim that loses HP in the same window receives its own confirmation and combo increment.
-- **Dead/invalid victims:** rejected before the effect and cannot receive later poison, launch, or combo increments.
-
-The `HitActors` set prevents repeated `NotifyTick` frames from dealing damage continuously to the same victim inside one activation. It does not prevent a later authored activation from hitting that victim again, which is the mechanism used for deliberate multi-hit attacks.
-
-## 6. Damage, poison, and contact safety
-
-The post-fix order is important:
-
-```text
-trace overlap
-    -> ApplyDamageToTarget
-        -> confirmed HP decrease?
-            no  -> stop; no combo, poison, stamina gain, launch, or knockback
-            yes -> allow authored secondary effects
+    Hit --> Damage --> EnemyHP
+    Attack --> Cost --> PlayerStamina
+    Regen --> PlayerStamina
+    Poison --> EnemyHP
+    Poison --> Cue
 ```
 
-Enemy `ExtraEffectOnHit` (the poison GameplayEffect) is applied only in the `true` branch after the damage gate. The enemy hitbox is restricted to player targets and its authored attack notify is delayed into the telegraph/contact portion of the attack. The old debug poison input and contact-triggered poison path are removed.
+Resource decisions:
 
-This keeps collision overlap, damage confirmation, and secondary effects separate:
+- Player startup stamina is initialized to `50%` of maximum.
+- The four-hit E lane has a `SkillComboTotalCost` of `50`, split into `12.5` per S4–S7 hit window.
+- S4 checks the full budget; each E hit window owns its own payment so interruption/whiff behavior remains tied to authored windows.
+- `GE_StaminaRegen` restores stamina over time.
+- Normal confirmed player hits may restore a configured amount, clamped to maximum; E windows do not refund stamina.
+- `GE_PoisonDoT` and `GC_Poison` are applied only from a confirmed enemy hit path.
 
-- proximity alone is not an attack;
-- an overlap without HP loss is not a combo point;
-- poison is a property of a confirmed enemy hit, not of touching an enemy capsule.
+## 6. VFX trigger contract
 
-## 7. Stamina and E-chain contract
+The project has two separate cosmetic lanes:
 
-The current E behavior is a four-window budget:
+```mermaid
+flowchart TD
+    Montage[Montage timeline]
+    Action[Action VFX\nTimed Niagara notify/state\nattached socket]
+    Window[ANS_MeleeHitbox\ntrace window]
+    Confirm{ApplyDamageToTarget == true?}
+    Impact[Confirmed Hit VFX Entries\nimpact point + normal + per-entry transform]
+    Whiff[Whiff: no impact effect]
 
-| Event | Stamina behavior |
-|---|---|
-| Initial E entry | requires the full 50-point budget; the legacy upfront cost in `AdvanceSkill` was removed |
-| S4, S5, S6, S7 notify begin | spends 12.5 per authored window |
-| Normal confirmed player hit | restores the configured normal-hit amount, clamped to max |
-| E hit window | does not refund stamina |
-| Starting state | player begins at 50% stamina |
-
-The first E window also performs the minimum/full-budget check. A failed player stamina window exits without stopping the montage, allowing the normal completion/interruption cleanup path to clear attacking state. This is the guard against the animation-lock symptom seen earlier.
-
-## 8. HUD contract
-
-`UCombatPlayerHUDWidget` builds its UMG hierarchy natively and binds once to the observed player character:
-
-```text
-OnHealthChanged  -> HP bar/text
-OnStaminaChanged -> stamina bar/text + E READY label
-OnComboChanged   -> COMBO xN text
+    Montage --> Action
+    Montage --> Window --> Confirm
+    Confirm -->|true| Impact
+    Confirm -->|false| Whiff
 ```
 
-The widget does not calculate damage, inspect hitboxes, or poll every frame. It only renders the character-owned values. Consequently, the HUD's combo number has the same semantics as `ACombatCharacterBase::ComboCount`: confirmed target hits in the current streak.
+`UANS_TimedNiagaraEffect` owns a socket-attached component per mesh, with explicit `Template`, `SocketName`, location/rotation offsets, scale and end cleanup. The current E lane uses the project-owned `NS_ECombo_ElectricTrail` on `hand_r` across S4–S7.
 
-## 9. QA interpretation guide
+`UANS_MeleeHitbox` exposes one visible `Confirmed Hit VFX` array of `FConfirmedHitVFXEntry` values. Each entry supports:
 
-Use the following observations when validating a recording or PIE session:
+- Niagara or Cascade effect;
+- local location offset;
+- local rotation offset;
+- independent scale;
+- optional alignment of local Z to the impact normal.
 
-| Observation | Interpretation |
-|---|---|
-| One hitbox window touches three living enemies and HP drops on all three | combo increases by three |
-| The trace overlaps an actor but its HP does not change | no combo, no poison, no stamina refund |
-| Same enemy is hit in a later Dive/E notify | a new combo point is valid |
-| Same enemy is found by several trace frames in one notify | `HitActors` dedupe prevents duplicate points |
-| Enemy attacks the player | does not add to the player's combo counter |
-| No confirmed hit for two seconds | combo resets to zero |
-| A hit kills the enemy | the killing confirmation counts; later windows reject the dead actor |
+The runtime spawns entries only after real HP loss. Legacy fields remain hidden and serialized solely to preserve old montage data; the unified entry array takes precedence when populated.
 
-For a deterministic three-enemy check, record the combo value before the attack, then count confirmed HP transitions per enemy per notify window. The expected final value is:
+## 7. Camera, cinematic and HUD ownership
 
-```text
-starting combo + number of successful (attacker, victim, notify-window) confirmations
+### Camera
+
+The existing Blueprint SpringArm and Camera components remain the physical camera. Native code supplies the combat policy:
+
+- target-aware arm length and FOV interpolation;
+- torso framing offset (`+40uu` target offset);
+- translation lag `8`, rotation lag `10`, max lag distance `90uu`;
+- camera collision remains enabled against world geometry;
+- combat character capsule/mesh ignore `ECC_Camera` to prevent enemy-body zoom;
+- hit shake runs only for the local player and only after confirmed damage.
+
+The S7 `FinisherCinematicWindow` is an animation adapter around `BeginFinisherCinematic()` and `EndFinisherCinematic()`. It temporarily drives orbit/framing and global time dilation, then restores control rotation, spring-arm values, FOV and time dilation on normal end, montage change, death or `EndPlay`.
+
+### HUD
+
+`UCombatPlayerHUDWidget` constructs its native UMG hierarchy once and subscribes to delegates:
+
+```mermaid
+flowchart LR
+    Attr[Attribute change] --> Health[OnHealthChanged]
+    Attr --> Stamina[OnStaminaChanged]
+    Hit[Confirmed hit] --> Combo[OnComboChanged]
+    Health --> HP[HP bar and text]
+    Stamina --> SP[Stamina bar and E READY]
+    Combo --> CT[COMBO xN]
 ```
 
-Do not compare the HUD directly with the number of montage names in the combo list; those are different quantities.
+The widget does not calculate damage, inspect hitboxes or poll every frame. It renders values already owned by the character/GAS layer.
 
-## 10. Extension guidance (not part of this pass)
+## 8. Wave lifecycle and reset contract
 
-If a future design needs both notions, keep the current confirmed-hit streak and add a separate semantic value rather than changing its meaning:
-
-- `ComboCount`: confirmed target-hit streak, current behavior.
-- `AttackSequenceCount`: authored player attack steps accepted by the combo state machine.
-- Optional per-window telemetry: attack/montage id, notify id, victim id, damage result.
-
-That separation would allow a designer-facing “9-step chain” display while retaining the responsive multi-target hit streak used by the current HUD. It is intentionally deferred because changing the existing counter would alter working combat feel and is not required for the submission.
-
-## 11. Verification record
-
-The implementation pass preceding this audit was built for both game and editor targets on UE 5.4.4. PIE traces verified that enemy damage begins at the authored attack contact window rather than on capsule contact, and that the player E path reaches cleanup instead of remaining permanently attacking when a stamina window fails.
-
-This document records the source-level combo audit and the expected interpretation of the observed `COMBO x21`. No combat code, Blueprint graph, montage timing, or HUD behavior was changed to produce this documentation.
-
-## 12. VFX trigger contract — first pass implemented
-
-The first pass wires the imported `Easy_Impact_Frames` pack under `/Game/Vefects/Easy_Impact_Frames`. The pack contains 200 `.uasset` files; the runtime candidate is `NS_Impact_Frame_01` and the S7 author-time burst uses `NS_Impact_Frame_01_Always`. The other `Static`, `Distortion`, and `Advanced` variants remain explicit designer choices.
-
-Use two separate notify lanes:
-
-```text
-Montage notify track
-├─ Timed Niagara notify/state
-│  └─ slash, arc, trail, dust: spawn at an authored socket and play on every attack
-└─ ANS_MeleeHitbox with optional ImpactVFX
-   └─ trace → ApplyDamageToTarget == true → spawn impact at Hit.ImpactPoint
+```mermaid
+stateDiagram-v2
+    [*] --> NotStarted
+    NotStarted --> SpawningWave1: BeginPlay / bAutoStart
+    SpawningWave1 --> WaitingWave1: all wave 1 enemies removed
+    WaitingWave1 --> SpawningWave2: DelayBetweenWaves
+    SpawningWave2 --> WaitingWave2: all wave 2 enemies removed
+    WaitingWave2 --> SpawningWave3: DelayBetweenWaves
+    SpawningWave3 --> Completed: all wave 3 enemies removed
+    Completed --> SpawningWave1: IA_Reset / R
 ```
 
-### Author-time effects
+`ACombatWaveSpawner` is event-driven and does not need a Tick loop. `OnCharacterDied` advances the logical state immediately; `OnDestroyed` is a safety fallback for actors removed outside the damage path. `ResetWaves()` clears both spawn timers, unregisters delegates, destroys tracked live enemies, resets state, and calls `StartWaves()`.
 
-Slash streaks, weapon trails, anticipation flashes, and ground dust that describe the action belong directly on the montage timeline. A `UAnimNotifyState_TimedNiagaraEffect`-style notify is appropriate for an effect that follows a socket for the notify duration; a one-shot `UAnimNotify_PlayNiagaraEffect`-style notify is appropriate for a burst that owns its own finite Niagara lifetime. These effects must not be made dependent on whether the hitbox finds a target.
+The character binds the existing `/Game/ThirdPerson/Input/Actions/IA_Reset` action natively in `SetupPlayerInputComponent()`. The handler resets completed spawners in the current world and ignores early input while the run is still active. Keeping reset ownership in the spawner means the input layer remains a thin adapter and the lifecycle cleanup has one owner.
 
-### Confirmed-hit effects
+## 9. SOLID assessment
 
-An impact frame is not an unconditional one-shot notify, because it would play on a whiff. The first pass implements optional `ConfirmedHitVFX` on `UANS_MeleeHitbox`. After the existing `ApplyDamageToTarget()` gate returns `true`, the notify spawns the system at the confirmed `FHitResult` impact point, oriented from the hit normal; if the trace does not provide a useful point, it falls back to the victim location. The spawn occurs once per victim per active hitbox window because `HitActors` already owns that dedupe. A miss, dead target, rejected damage, or invulnerable target produces no confirmed impact VFX.
+| Principle | Current design | Why it matters |
+|---|---|---|
+| Single Responsibility | `UCombatAttributeSet`, `UANS_MeleeHitbox`, `UANS_TimedNiagaraEffect`, `UANS_FinisherCinematic`, HUD and wave spawner each own a bounded concern. The character is a bounded combat facade for this single-player test. | A bug in VFX timing does not require changing damage math. |
+| Open/Closed | Montage arrays and notify properties extend attack behavior. | New moves usually require data, not copied C++. |
+| Liskov Substitution | `BP_ThirdPersonCharacter` and `BP_Enemy` share `ACombatCharacterBase` for GAS, damage, death and hit reactions. | Damage/death/GAS logic is consistent for both actor types. |
+| Interface Segregation | Delegates expose narrow health, stamina, combo and death signals. | HUD and spawner avoid depending on unrelated actor internals. |
+| Dependency Inversion | Gameplay effects and event contracts sit between producers and consumers. | Presentation and wave progression react to events rather than polling implementation details. |
 
-This keeps visual timing on the animation while keeping truth in gameplay: the notify says *when an attack can connect*, and the hit resolver says *whether it actually connected*. Impact systems should be finite/auto-deactivating; infinite systems belong to a separate stateful effect with an explicit cleanup path.
+The only intentionally broad class is `ACombatCharacterBase`, which remains the bounded orchestration/facade for this single-player assignment. Extracting multiple components now would increase migration surface without a second consumer. The next justified extraction would be driven by a second playable archetype, multiplayer ownership or a reusable camera/targeting consumer.
 
-## 13. E4/S7 finisher cinematic — first pass implemented
+## 10. Design patterns
 
-The final E attack is `S7` in the current `[S4, S5, S6, S7]` skill lane. The first pass starts only after the S7 hit window confirms at least one real victim. A whiff remains an ordinary attack: the confirmed impact path and finisher camera are not entered.
+- **Facade/orchestrator:** `ACombatCharacterBase` presents the small combat API used by notifies and Blueprint.
+- **Adapter:** animation notify/state classes translate timeline callbacks into traces, Niagara attachment and camera control.
+- **Observer:** GAS and character delegates feed HUD and wave state without Tick polling.
+- **Data-driven Strategy:** montage arrays, notify properties, VFX entries and GameplayEffects select behavior.
+- **State machine:** combo lane/window/buffer transitions and wave progression are explicit and converge on cleanup methods.
 
-Implemented sequence:
+## 11. Extension rules
 
-1. The S7 `ANS_MeleeHitbox` owns `bStartFinisherCinematic`; the existing damage gate remains authoritative.
-2. On the first confirmed hit, snapshot living `ACombatCharacterBase` enemies within `900uu`, store each original `CustomTimeDilation`, and slow them to `0.18`. The player and enemies outside the radius are not slowed.
-3. `BeginFinisherCinematic()` temporarily drives the existing camera through control rotation, easing `110°` of yaw over `0.9s`, with a `390uu` arm and `76°` FOV target. Normal `UpdateCombatCamera()` yields while this mode is active.
-4. `NS_Impact_Frame_01_Always` is attached to S7 as a one-shot `Play Niagara Effect` notify at the authored contact time. The confirmed `NS_Impact_Frame_01` path remains hit-gated and is spawned at each valid impact point.
-5. `EndFinisherCinematic()` restores all tracked dilation and control/camera state. It also runs on montage interruption, death, and `EndPlay`; the normal camera code then interpolates arm/FOV back to combat framing.
+### Add a normal attack
 
-PIE smoke verification confirmed the active flag, `0.18` enemy dilation, Niagara component spawn, and automatic restoration to `1.0` after the short sequence. Visual tuning and a manual controller-driven S7 hit against a real target remain QA follow-ups.
+1. Create/retarget the animation sequence.
+2. Trim an independent montage under `Content/Game/Combat/Montages`.
+3. Add it to the appropriate Blueprint montage array.
+4. Add `ANS_ComboWindow` around the measured contact frame.
+5. Add `ANS_MeleeHitbox` with socket, radius, damage and optional confirmed-hit feedback.
+6. Add an attached `UANS_TimedNiagaraEffect` only if the attack needs an action trail.
 
-## 14. Perfect dodge — deferred
+No new damage resolver or combo counter is required.
 
-The existing Phase 5 plan describes a normal dodge with movement plus a broad invulnerability window. Perfect dodge is a narrower result inside that dodge, not a second input: an enemy hitbox must actually reach the player during the perfect sub-window. Merely pressing dodge near an enemy is not enough.
+### Add a multi-hit attack
 
-Use three conceptual results in the incoming-hit resolver:
+Use multiple authored hitbox activations. The per-activation `HitActors` set prevents accidental per-frame repeats while allowing the same victim to be hit by a later intentional window.
 
-```text
-Outside dodge i-frames  → apply damage/reaction normally
-Inside normal i-frames  → reject damage silently
-Inside perfect window   → reject damage + emit one PerfectDodge event
-```
+### Add a new confirmed impact effect
 
-`UANS_MeleeHitbox` is the correct source of contact because it already performs the authored socket sweep and owns per-window dedupe. It should ask the victim's native dodge state to resolve the hit before applying damage; the perfect-dodge response can then trigger a short counter opportunity, small camera cue, and optional time pulse without allowing damage, poison, launch, or hit reaction through. Consume the perfect response once per dodge activation while continuing to block every valid hit during the remaining i-frames.
+Add an entry to the visible `Confirmed Hit VFX` array and tune its transform there. Keep it out of the action trail lane so a whiff cannot create a false impact cue.
 
-The perfect sub-window should initially sit near the front of the existing `0.03s → 0.19s` i-frame range, then be tuned from recorded enemy contact times. Required cleanup cases are the same as normal dodge: montage interruption, death, landing, and actor destruction must remove the state and restore movement exactly once. This feature remains design/implementation work for a later pass.
+### Add a new wave
+
+Add a `FCombatWaveDefinition` entry on the placed `BP_WaveSpawner` actor. The spawner already owns enemy tracking, completion and transition timing.
+
+## 12. Verification record
+
+The current checkout was built for both game and editor targets on UE 5.4.4. Focused PIE traces verified:
+
+- damage starts from authored hit windows rather than capsule proximity;
+- confirmed effects and combo accounting follow real HP decrease;
+- enemy wave completion advances without Tick polling;
+- final-wave completion plus actual keyboard `R` produces the reset log and starts wave 1;
+- early `R` input is ignored;
+- timed Niagara components clean up after the E trail window;
+- recent PIE log scan has no new project `LogTemp`, Blueprint, Niagara or Material errors.
+
+Perfect dodge is not part of this Test 1 implementation; it belongs to Test 2 and is intentionally not represented as a shipped feature here.

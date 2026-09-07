@@ -14,6 +14,7 @@ public class aether_testEditor : ModuleRules
 			"Engine",
 			"Niagara",
 			"NiagaraAnimNotifies",
+			"AssetTools",
 			"UnrealEd",
 			"BlueprintGraph",
 			"LevelEditor",

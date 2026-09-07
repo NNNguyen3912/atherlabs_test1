@@ -56,4 +56,17 @@ public:
 	/** Wires confirmed-hit Niagara VFX and the S7 finisher notify into authored player montages. */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Editor")
 	static FString ConfigureCombatVFXAndFinisher();
+
+	/** Applies one per-effect transform sample to the first hit window in AM_Ground_A1. */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Editor")
+	static FString ConfigureConfirmedHitVFXTransformSample();
+
+	/** Migrates all legacy hitbox VFX fields into the unified Confirmed Hit VFX entry list. */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Editor")
+	static FString MigrateHitboxVFXToUnifiedEntries();
+
+	/** Creates an NS_Trail_10/NS_Trail_15 hybrid and tracks it on hand_r across S4-S7. */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Editor")
+	static FString ConfigureEComboElectricTrailSample();
+
 };

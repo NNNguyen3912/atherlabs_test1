@@ -8,12 +8,44 @@
 
 class ACombatCharacterBase;
 class UNiagaraSystem;
+class UParticleSystem;
+class UFXSystemAsset;
 
 UENUM(BlueprintType)
 enum class ECombatKnockbackDirection : uint8
 {
 	AwayFromAttacker UMETA(DisplayName = "Away From Attacker"),
 	AttackerForward UMETA(DisplayName = "Attacker Forward")
+};
+
+/**
+ * One confirmed-hit VFX effect with an authored transform.
+ * LocationOffset is relative to the impact-normal frame when bAlignToHitNormal is enabled.
+ */
+USTRUCT(BlueprintType)
+struct AETHER_TEST_API FConfirmedHitVFXEntry
+{
+	GENERATED_BODY()
+
+	/** Niagara or Cascade system to spawn after real damage is confirmed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VFX", meta = (DisplayName = "Effect"))
+	TObjectPtr<UFXSystemAsset> Effect = nullptr;
+
+	/** Local offset from the confirmed impact point. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VFX", meta = (DisplayName = "Location Offset"))
+	FVector LocationOffset = FVector::ZeroVector;
+
+	/** Local rotation applied after the optional hit-normal alignment. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VFX", meta = (DisplayName = "Rotation Offset"))
+	FRotator RotationOffset = FRotator::ZeroRotator;
+
+	/** Per-effect scale used directly when this entry is spawned. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VFX", meta = (DisplayName = "Scale", ClampMin = "0.01"))
+	FVector Scale = FVector::OneVector;
+
+	/** Align local Z to the surface normal before applying the authored offsets. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VFX", meta = (DisplayName = "Align To Hit Normal"))
+	bool bAlignToHitNormal = true;
 };
 
 /**
@@ -62,20 +94,29 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback", meta = (ClampMin = "0.0", ClampMax = "2.0"))
 	float CameraShakeScale = 0.35f;
 
-	/** Optional Niagara effect spawned only after ApplyDamageToTarget confirms real HP loss. */
-	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback")
+	/** One unified list for every confirmed-hit VFX effect and its transform. */
+	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback", meta = (DisplayName = "Confirmed Hit VFX"))
+	TArray<FConfirmedHitVFXEntry> ConfirmedHitVFXEntries;
+
+	/** Legacy Niagara list kept serialized for one-time migration; hidden from Details. */
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Use Confirmed Hit VFX"))
+	TArray<TObjectPtr<UNiagaraSystem>> ConfirmedHitVFXList;
+
+	/** Legacy Cascade list kept serialized for one-time migration; hidden from Details. */
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Use Confirmed Hit VFX"))
+	TArray<TObjectPtr<UParticleSystem>> ConfirmedHitParticleVFXList;
+
+	/** Legacy single-slot data kept for existing montage assets; hidden from the Details panel. */
+	UPROPERTY()
 	TObjectPtr<UNiagaraSystem> ConfirmedHitVFX;
 
-	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback", meta = (ClampMin = "0.01"))
+	/** Legacy single-slot data kept for existing montage assets; hidden from the Details panel. */
+	UPROPERTY()
+	TObjectPtr<UParticleSystem> ConfirmedHitParticleVFX;
+
+	/** Legacy global scale kept serialized for one-time migration; hidden from Details. */
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Set per-entry Scale in Confirmed Hit VFX"))
 	float ConfirmedHitVFXScale = 1.f;
-
-	/** Starts the short E4/S7 finisher camera after the first confirmed hit in this window. */
-	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback")
-	bool bStartFinisherCinematic = false;
-
-	/** Optional one-shot VFX placed at the attacker's feet when the finisher starts. */
-	UPROPERTY(EditAnywhere, Category = "Hitbox|Feedback")
-	TObjectPtr<UNiagaraSystem> FinisherVFX;
 
 	/** Optional stamina cost paid when this authored hit window starts (E uses 12.5 x 4). */
 	UPROPERTY(EditAnywhere, Category = "Hitbox|Stamina", meta = (ClampMin = "0.0"))

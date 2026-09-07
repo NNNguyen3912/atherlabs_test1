@@ -5,18 +5,21 @@
 #include "AbilitySystemInterface.h"
 #include "AbilitySystemComponent.h"
 #include "CombatAttributeSet.h"
+#include "CombatCinematicTypes.h"
 #include "CombatCharacterBase.generated.h"
 
 class UGameplayAbility;
 class UGameplayEffect;
+class UInputAction;
 class UAnimMontage;
 class UAnimSequenceBase;
 class UCameraShakeBase;
-class UNiagaraSystem;
 class UCombatPlayerHUDWidget;
+class ACombatWaveSpawner;
 class ACombatCharacterBase;
 class APlayerController;
 struct FOnAttributeChangeData;
+struct FInputActionValue;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FCombatAttributeChanged, float, NewValue, float, MaxValue);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCombatCharacterDied, ACombatCharacterBase*, DeadCharacter);
@@ -49,6 +52,10 @@ public:
 	/** Effect chay luc khoi tao (init chi so, hoi stamina...) — khai bao trong Blueprint con */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GAS")
 	TArray<TSubclassOf<UGameplayEffect>> StartupEffects;
+
+	/** Enhanced Input action used to restart the completed test wave run. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Input")
+	TObjectPtr<UInputAction> ResetWavesInputAction;
 
 	/** GE Instant tru stamina, magnitude SetByCaller tag Data.StaminaCost — gan GE_StaminaCost trong BP con */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GAS")
@@ -111,11 +118,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|Camera")
 	void PlayCombatCameraShake(float Scale = 1.f);
 
-	/** Starts the short E4/S7 camera orbit and slows living enemies around the player. */
+	/** Starts a notify-authored camera orbit and global slow-motion window. */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Camera")
-	void BeginFinisherCinematic(ACombatCharacterBase* InitialVictim, UNiagaraSystem* FinisherVFX = nullptr);
+	void BeginFinisherCinematic(float Duration, const FFinisherCinematicSettings& Settings);
 
-	/** Restores camera and per-enemy time dilation after the finisher or an interruption. */
+	/** Restores camera and global time dilation after the notify or an interruption. */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Camera")
 	void EndFinisherCinematic();
 
@@ -182,6 +189,7 @@ protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
+	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 	virtual void Landed(const FHitResult& Hit) override;
 	virtual void PossessedBy(AController* NewController) override;
 	virtual void OnRep_Controller() override;
@@ -203,6 +211,7 @@ protected:
 	void UpdateCombatFacing(float DeltaSeconds);
 	void UpdateCombatCamera(float DeltaSeconds);
 	void UpdateFinisherCinematic(float DeltaSeconds);
+	void HandleResetWavesInput(const FInputActionValue& ActionValue);
 	ACombatCharacterBase* FindNearestCombatTarget() const;
 
 	/** Keeps an optional world-space/screen-space HPBar widget in sync with GAS. */
@@ -275,30 +284,6 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher")
 	bool bFinisherCinematicEnabled = true;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "0.1", ClampMax = "3.0"))
-	float FinisherCinematicDuration = 0.9f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "100.0"))
-	float FinisherSlowRadius = 900.f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "0.01", ClampMax = "1.0"))
-	float FinisherEnemyTimeDilation = 0.18f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "100.0"))
-	float FinisherCameraArmLength = 390.f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "1.0", ClampMax = "179.0"))
-	float FinisherCameraFOV = 76.f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher")
-	float FinisherCameraOrbitDegrees = 110.f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher")
-	float FinisherCameraPitchOffset = 3.f;
-
-	UPROPERTY(EditDefaultsOnly, Category = "Combat|Camera|Finisher", meta = (ClampMin = "1.0"))
-	float FinisherCameraInterpSpeed = 10.f;
-
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "Combat|Targeting")
 	TObjectPtr<ACombatCharacterBase> CurrentCombatTarget;
 
@@ -320,15 +305,13 @@ protected:
 	UPROPERTY(Transient)
 	bool bCameraFollowTuningApplied = false;
 
-	struct FFinisherSlowTarget
-	{
-		TWeakObjectPtr<ACombatCharacterBase> Character;
-		float OriginalTimeDilation = 1.f;
-	};
-
 	bool bFinisherCinematicActive = false;
 
 	float FinisherCinematicElapsed = 0.f;
+	float FinisherCinematicDuration = 0.45f;
+	float FinisherOriginalGlobalTimeDilation = 1.f;
+	bool bFinisherChangedGlobalTimeDilation = false;
+	FFinisherCinematicSettings ActiveFinisherSettings;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UAnimMontage> FinisherMontage;
@@ -337,8 +320,9 @@ protected:
 	FRotator FinisherStartControlRotation = FRotator::ZeroRotator;
 	FRotator FinisherStartBoomRotation = FRotator::ZeroRotator;
 	FVector FinisherStartTargetOffset = FVector::ZeroVector;
+	float FinisherStartArmLength = 0.f;
+	float FinisherStartFOV = 90.f;
 	bool bFinisherUsesControlRotation = false;
-	TArray<FFinisherSlowTarget> FinisherSlowTargets;
 
 	FTimerHandle ComboResetTimer;
 

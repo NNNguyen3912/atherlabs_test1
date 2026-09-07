@@ -16,12 +16,16 @@
 #include "GameFramework/PlayerController.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "EnhancedInputComponent.h"
+#include "InputAction.h"
+#include "InputActionValue.h"
 #include "GameplayEffect.h"
 #include "GameplayAbilitySpec.h"
 #include "TimerManager.h"
+#include "CombatWaveSpawner.h"
 #include "CombatCameraShake.h"
-#include "NiagaraFunctionLibrary.h"
-#include "NiagaraSystem.h"
+#include "Kismet/GameplayStatics.h"
+#include "UObject/ConstructorHelpers.h"
 
 ACombatCharacterBase::ACombatCharacterBase()
 {
@@ -30,6 +34,27 @@ ACombatCharacterBase::ACombatCharacterBase()
 	ASC = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("ASC"));
 	Attributes = CreateDefaultSubobject<UCombatAttributeSet>(TEXT("Attributes"));
 	PlayerHUDClass = UCombatPlayerHUDWidget::StaticClass();
+
+	static ConstructorHelpers::FObjectFinder<UInputAction> ResetActionFinder(
+		TEXT("/Game/ThirdPerson/Input/Actions/IA_Reset.IA_Reset"));
+	if (ResetActionFinder.Succeeded())
+	{
+		ResetWavesInputAction = ResetActionFinder.Object;
+	}
+}
+
+void ACombatCharacterBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+{
+	Super::SetupPlayerInputComponent(PlayerInputComponent);
+
+	UEnhancedInputComponent* EnhancedInput = Cast<UEnhancedInputComponent>(PlayerInputComponent);
+	if (!EnhancedInput || !ResetWavesInputAction)
+	{
+		return;
+	}
+
+	EnhancedInput->BindAction(
+		ResetWavesInputAction, ETriggerEvent::Started, this, &ACombatCharacterBase::HandleResetWavesInput);
 }
 
 void ACombatCharacterBase::BeginPlay()
@@ -403,7 +428,8 @@ void ACombatCharacterBase::PlayCombatCameraShake(float Scale)
 		UCombatHitCameraShake::StaticClass(), FMath::Clamp(Scale, 0.f, 2.f));
 }
 
-void ACombatCharacterBase::BeginFinisherCinematic(ACombatCharacterBase* InitialVictim, UNiagaraSystem* FinisherVFX)
+void ACombatCharacterBase::BeginFinisherCinematic(
+	float Duration, const FFinisherCinematicSettings& Settings)
 {
 	if (bFinisherCinematicActive || !bFinisherCinematicEnabled || bIsDead || !IsPlayerControlled())
 	{
@@ -428,60 +454,36 @@ void ACombatCharacterBase::BeginFinisherCinematic(ACombatCharacterBase* InitialV
 	FinisherStartControlRotation = PlayerController->GetControlRotation();
 	FinisherStartBoomRotation = CameraBoom->GetComponentRotation();
 	FinisherStartTargetOffset = CameraBoom->TargetOffset;
+	FinisherStartArmLength = CameraBoom->TargetArmLength;
+	FinisherStartFOV = FollowCamera->FieldOfView;
 	bFinisherUsesControlRotation = CameraBoom->bUsePawnControlRotation;
 	FinisherCinematicElapsed = 0.f;
+	FinisherCinematicDuration = FMath::Max(0.01f, Duration);
+	ActiveFinisherSettings = Settings;
 	bFinisherCinematicActive = true;
 	FinisherMontage = GetMesh() && GetMesh()->GetAnimInstance()
 		? GetMesh()->GetAnimInstance()->GetCurrentActiveMontage()
 		: nullptr;
 
-	FinisherSlowTargets.Reset();
-	auto SlowTarget = [this](ACombatCharacterBase* Candidate)
-	{
-		if (!Candidate || Candidate == this || Candidate->bIsDead || Candidate->IsPlayerControlled()
-			|| FVector::DistSquared2D(GetActorLocation(), Candidate->GetActorLocation()) > FMath::Square(FinisherSlowRadius)
-			|| FinisherSlowTargets.ContainsByPredicate([Candidate](const FFinisherSlowTarget& Existing)
-			{
-				return Existing.Character.Get() == Candidate;
-			}))
-		{
-			return;
-		}
-
-		FFinisherSlowTarget& State = FinisherSlowTargets.AddDefaulted_GetRef();
-		State.Character = Candidate;
-		State.OriginalTimeDilation = Candidate->CustomTimeDilation;
-		Candidate->CustomTimeDilation = FMath::Min(Candidate->CustomTimeDilation, FinisherEnemyTimeDilation);
-	};
-
-	SlowTarget(InitialVictim);
-	for (TActorIterator<ACombatCharacterBase> It(World); It; ++It)
-	{
-		SlowTarget(*It);
-	}
-
-	if (FinisherVFX)
-	{
-		const float CapsuleHalfHeight = GetCapsuleComponent()
-			? GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
-			: 88.f;
-		UNiagaraFunctionLibrary::SpawnSystemAtLocation(
-			this, FinisherVFX,
-			GetActorLocation() - FVector(0.f, 0.f, CapsuleHalfHeight - 5.f),
-			FRotator::ZeroRotator, FVector(1.15f), true, true);
-	}
+	// Global dilation is the native UE mechanism that also slows particles,
+	// physics and every other world actor. The player's montage and the camera
+	// therefore remain synchronized to the authored notify window.
+	FinisherOriginalGlobalTimeDilation = UGameplayStatics::GetGlobalTimeDilation(World);
+	UGameplayStatics::SetGlobalTimeDilation(
+		World, FMath::Clamp(ActiveFinisherSettings.WorldTimeDilation, 0.01f, 1.f));
+	bFinisherChangedGlobalTimeDilation = true;
 }
 
 void ACombatCharacterBase::EndFinisherCinematic()
 {
-	for (const FFinisherSlowTarget& State : FinisherSlowTargets)
+	if (bFinisherChangedGlobalTimeDilation)
 	{
-		if (ACombatCharacterBase* Character = State.Character.Get())
+		if (UWorld* World = GetWorld())
 		{
-			Character->CustomTimeDilation = State.OriginalTimeDilation;
+			UGameplayStatics::SetGlobalTimeDilation(World, FinisherOriginalGlobalTimeDilation);
 		}
+		bFinisherChangedGlobalTimeDilation = false;
 	}
-	FinisherSlowTargets.Reset();
 
 	if (bFinisherCinematicActive)
 	{
@@ -496,10 +498,15 @@ void ACombatCharacterBase::EndFinisherCinematic()
 		if (USpringArmComponent* CameraBoom = FindComponentByClass<USpringArmComponent>())
 		{
 			CameraBoom->TargetOffset = FinisherStartTargetOffset;
+			CameraBoom->TargetArmLength = FinisherStartArmLength;
 			if (!bFinisherUsesControlRotation)
 			{
 				CameraBoom->SetWorldRotation(FinisherStartBoomRotation);
 			}
+		}
+		if (UCameraComponent* FollowCamera = FindComponentByClass<UCameraComponent>())
+		{
+			FollowCamera->FieldOfView = FinisherStartFOV;
 		}
 	}
 
@@ -817,23 +824,36 @@ void ACombatCharacterBase::UpdateFinisherCinematic(float DeltaSeconds)
 		return;
 	}
 
-	if (FinisherMontage)
+	UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
+	if (!AnimInstance)
 	{
-		UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
-		if (!AnimInstance || AnimInstance->GetCurrentActiveMontage() != FinisherMontage)
-		{
-			EndFinisherCinematic();
-			return;
-		}
+		EndFinisherCinematic();
+		return;
+	}
+
+	// A notify placed on the first montage frame can run before the AnimInstance
+	// exposes the montage as active. Capture it on the next tick instead of
+	// ending the cinematic because the initial snapshot was null.
+	UAnimMontage* CurrentMontage = AnimInstance->GetCurrentActiveMontage();
+	if (!FinisherMontage)
+	{
+		FinisherMontage = CurrentMontage;
+	}
+	else if (CurrentMontage != FinisherMontage)
+	{
+		EndFinisherCinematic();
+		return;
 	}
 
 	FinisherCinematicElapsed += FMath::Max(0.f, DeltaSeconds);
 	const float Alpha = FMath::Clamp(
-		FinisherCinematicElapsed / FMath::Max(0.1f, FinisherCinematicDuration), 0.f, 1.f);
-	const float Ease = FMath::InterpEaseInOut(0.f, 1.f, Alpha, 2.f);
+		FinisherCinematicElapsed / FMath::Max(0.01f, FinisherCinematicDuration), 0.f, 1.f);
+	const float RotationAlpha = ActiveFinisherSettings.bEaseInOut
+		? FMath::InterpEaseInOut(0.f, 1.f, Alpha, FMath::Max(1.f, ActiveFinisherSettings.EaseExponent))
+		: Alpha;
 	FRotator DesiredRotation = FinisherStartControlRotation;
-	DesiredRotation.Yaw += FinisherCameraOrbitDegrees * Ease;
-	DesiredRotation.Pitch += FinisherCameraPitchOffset * Ease;
+	DesiredRotation.Yaw += ActiveFinisherSettings.OrbitDegrees * RotationAlpha;
+	DesiredRotation.Pitch += ActiveFinisherSettings.PitchOffset * RotationAlpha;
 	DesiredRotation.Roll = 0.f;
 
 	if (bFinisherUsesControlRotation)
@@ -845,17 +865,44 @@ void ACombatCharacterBase::UpdateFinisherCinematic(float DeltaSeconds)
 		CameraBoom->SetWorldRotation(DesiredRotation);
 	}
 
+	const float FramingInterpSpeed = FMath::Max(0.1f, ActiveFinisherSettings.FramingInterpSpeed);
 	CameraBoom->TargetArmLength = FMath::FInterpTo(
-		CameraBoom->TargetArmLength, FinisherCameraArmLength, DeltaSeconds, FinisherCameraInterpSpeed);
+		CameraBoom->TargetArmLength, ActiveFinisherSettings.ArmLength, DeltaSeconds, FramingInterpSpeed);
 	CameraBoom->TargetOffset.Z = FMath::FInterpTo(
-		CameraBoom->TargetOffset.Z, FinisherStartTargetOffset.Z + 25.f,
-		DeltaSeconds, FinisherCameraInterpSpeed);
+		CameraBoom->TargetOffset.Z, FinisherStartTargetOffset.Z + ActiveFinisherSettings.TargetOffsetZ,
+		DeltaSeconds, FramingInterpSpeed);
 	FollowCamera->FieldOfView = FMath::FInterpTo(
-		FollowCamera->FieldOfView, FinisherCameraFOV, DeltaSeconds, FinisherCameraInterpSpeed);
+		FollowCamera->FieldOfView, ActiveFinisherSettings.FieldOfView, DeltaSeconds, FramingInterpSpeed);
 
-	if (Alpha >= 1.f)
+}
+
+void ACombatCharacterBase::HandleResetWavesInput(const FInputActionValue& ActionValue)
+{
+	if (!IsPlayerControlled())
 	{
-		EndFinisherCinematic();
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	int32 ResetSpawnerCount = 0;
+	for (TActorIterator<ACombatWaveSpawner> It(World); It; ++It)
+	{
+		ACombatWaveSpawner* Spawner = *It;
+		if (Spawner && Spawner->HasCompletedAllWaves())
+		{
+			Spawner->ResetWaves();
+			++ResetSpawnerCount;
+		}
+	}
+
+	if (ResetSpawnerCount == 0)
+	{
+		UE_LOG(LogTemp, Display, TEXT("Wave reset ignored: the configured wave run is not complete yet."));
 	}
 }
 

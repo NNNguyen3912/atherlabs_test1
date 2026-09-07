@@ -42,6 +42,65 @@ void ACombatWaveSpawner::StartWaves()
 	StartCurrentWave();
 }
 
+void ACombatWaveSpawner::ResetWaves()
+{
+	if (Waves.IsEmpty())
+	{
+		return;
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SpawnTimer);
+		World->GetTimerManager().ClearTimer(NextWaveTimer);
+	}
+
+	TArray<AActor*> EnemiesToDestroy;
+	EnemiesToDestroy.Reserve(ActiveEnemies.Num());
+	for (const TWeakObjectPtr<AActor>& ActiveEnemy : ActiveEnemies)
+	{
+		if (AActor* Enemy = ActiveEnemy.Get())
+		{
+			EnemiesToDestroy.Add(Enemy);
+		}
+	}
+	ActiveEnemies.Empty();
+
+	for (AActor* Enemy : EnemiesToDestroy)
+	{
+		if (ACombatCharacterBase* Character = Cast<ACombatCharacterBase>(Enemy))
+		{
+			Character->OnCharacterDied.RemoveDynamic(this, &ACombatWaveSpawner::HandleEnemyDied);
+		}
+		Enemy->OnDestroyed.RemoveDynamic(this, &ACombatWaveSpawner::HandleEnemyDestroyed);
+		if (!Enemy->IsActorBeingDestroyed())
+		{
+			Enemy->Destroy();
+		}
+	}
+
+	bRunning = false;
+	bWaveCompletionQueued = false;
+	SpawnedThisWave = 0;
+	CurrentWaveIndex = INDEX_NONE;
+
+	UE_LOG(LogTemp, Display, TEXT("%s reset wave run and is starting from wave 1."), *GetName());
+	StartWaves();
+}
+
+bool ACombatWaveSpawner::HasCompletedAllWaves() const
+{
+	if (Waves.IsEmpty())
+	{
+		return false;
+	}
+
+	// Allow R during the final inter-wave delay as soon as the last enemy is gone.
+	const bool bFinalWaveQueued = bRunning && CurrentWaveIndex == Waves.Num() - 1
+		&& bWaveCompletionQueued && ActiveEnemies.IsEmpty();
+	return (!bRunning && CurrentWaveIndex >= Waves.Num()) || bFinalWaveQueued;
+}
+
 void ACombatWaveSpawner::StartCurrentWave()
 {
 	if (!bRunning || !Waves.IsValidIndex(CurrentWaveIndex))

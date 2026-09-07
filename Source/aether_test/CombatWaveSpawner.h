@@ -67,6 +67,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Wave")
 	void StartWaves();
 
+	/** Clears the current run and starts the configured waves again from wave 1. */
+	UFUNCTION(BlueprintCallable, Category = "Wave")
+	void ResetWaves();
+
+	/** True once the final configured wave has no remaining enemies. */
+	UFUNCTION(BlueprintPure, Category = "Wave")
+	bool HasCompletedAllWaves() const;
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;

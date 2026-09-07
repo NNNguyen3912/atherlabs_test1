@@ -1,12 +1,16 @@
 #include "EnemyBlueprintAutomationLibrary.h"
 
+#include "../aether_test/ANS_FinisherCinematic.h"
 #include "../aether_test/ANS_MeleeHitbox.h"
+#include "../aether_test/ANS_TimedNiagaraEffect.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
 #include "Animation/AnimNotifies/AnimNotifyState.h"
 #include "AnimNotify_PlayNiagaraEffect.h"
 #include "Animation/AnimTypes.h"
+#include "AssetToolsModule.h"
+#include "IAssetTools.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Editor.h"
 #include "EdGraph/EdGraph.h"
@@ -28,11 +32,16 @@
 #include "LevelEditor.h"
 #include "IAssetViewport.h"
 #include "Misc/PackageName.h"
+#include "Materials/MaterialInterface.h"
 #include "UObject/SavePackage.h"
 #include "UObject/UnrealType.h"
 #include "PlayInEditorDataTypes.h"
+#include "Particles/ParticleSystem.h"
 #include "ScopedTransaction.h"
 #include "NiagaraSystem.h"
+#include "NiagaraEmitter.h"
+#include "NiagaraEmitterHandle.h"
+#include "NiagaraRibbonRendererProperties.h"
 
 FString UEnemyBlueprintAutomationLibrary::ApplyEnemyP0PlayerValidGuard()
 {
@@ -552,7 +561,6 @@ FString UEnemyBlueprintAutomationLibrary::ConfigurePlayerStaminaHitWindows()
 		TEXT("/Game/Game/Combat/Montages/AM_Ground_A2.AM_Ground_A2"),
 		TEXT("/Game/Game/Combat/Montages/AM_Ground_A3.AM_Ground_A3"),
 		TEXT("/Game/Game/Combat/Montages/AM_Ground_A4.AM_Ground_A4"),
-		TEXT("/Game/Game/Combat/Montages/AM_Launcher_L1.AM_Launcher_L1"),
 		TEXT("/Game/Game/Combat/Montages/AM_Launcher_L2.AM_Launcher_L2"),
 		TEXT("/Game/Game/Combat/Montages/AM_Dive_D3.AM_Dive_D3")
 	};
@@ -635,6 +643,220 @@ FString UEnemyBlueprintAutomationLibrary::ConfigurePlayerStaminaHitWindows()
 
 	FString Result = FString::Printf(TEXT("Applied: %d hitboxes across %d montages (E=%0.1f / %d hits, normal gain=%0.1f)."),
 		ModifiedHitboxes, ModifiedMontages, 50.f / 4.f, 4, 8.f);
+	if (!Missing.IsEmpty())
+	{
+		Result += FString::Printf(TEXT(" Missing: %s"), *Missing);
+	}
+	return Result;
+}
+
+FString UEnemyBlueprintAutomationLibrary::ConfigureConfirmedHitVFXTransformSample()
+{
+	UAnimMontage* Montage = LoadObject<UAnimMontage>(nullptr,
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A1.AM_Ground_A1"));
+	UNiagaraSystem* SampleVFX = LoadObject<UNiagaraSystem>(nullptr,
+		TEXT("/Game/Mixed_Magic_VFX_Pack/VFX/NS_Dark_Solo_Impact.NS_Dark_Solo_Impact"));
+	if (!Montage || !SampleVFX)
+	{
+		return TEXT("Refused: AM_Ground_A1 or NS_Dark_Solo_Impact could not be loaded.");
+	}
+
+	UANS_MeleeHitbox* SampleHitbox = nullptr;
+	for (FAnimNotifyEvent& Event : Montage->Notifies)
+	{
+		if (UANS_MeleeHitbox* Candidate = Cast<UANS_MeleeHitbox>(Event.NotifyStateClass.Get()))
+		{
+			SampleHitbox = Candidate;
+			break;
+		}
+	}
+	if (!SampleHitbox)
+	{
+		return TEXT("Refused: AM_Ground_A1 has no ANS_MeleeHitbox notify.");
+	}
+
+	SampleHitbox->Modify();
+	SampleHitbox->ConfirmedHitVFXEntries.Reset();
+	FConfirmedHitVFXEntry& Entry = SampleHitbox->ConfirmedHitVFXEntries.AddDefaulted_GetRef();
+	Entry.Effect = SampleVFX;
+	Entry.LocationOffset = FVector(0.f, 0.f, 8.f);
+	Entry.RotationOffset = FRotator(0.f, 0.f, 90.f);
+	Entry.Scale = FVector(0.35f, 0.35f, 0.35f);
+	Entry.bAlignToHitNormal = true;
+	SampleHitbox->ConfirmedHitVFXList.Reset();
+	SampleHitbox->ConfirmedHitParticleVFXList.Reset();
+	SampleHitbox->ConfirmedHitVFX = nullptr;
+	SampleHitbox->ConfirmedHitParticleVFX = nullptr;
+	SampleHitbox->ConfirmedHitVFXScale = 1.f;
+
+	Montage->Modify();
+	Montage->MarkPackageDirty();
+	Montage->SortNotifies();
+	Montage->InitializeNotifyTrack();
+	Montage->RefreshCacheData();
+
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	SaveArgs.Error = GError;
+	UPackage* Package = Montage->GetOutermost();
+	FString PackageFileName;
+	if (!Package || !FPackageName::TryConvertLongPackageNameToFilename(
+		Package->GetName(), PackageFileName, FPackageName::GetAssetPackageExtension()) ||
+		!UPackage::SavePackage(Package, Montage, *PackageFileName, SaveArgs))
+	{
+		return TEXT("Applied the transform sample in memory, but saving AM_Ground_A1 failed.");
+	}
+
+	return TEXT("Applied unified transform sample to AM_Ground_A1: NS_Dark_Solo_Impact, Z+8, Roll+90, Scale 0.35.");
+}
+
+FString UEnemyBlueprintAutomationLibrary::MigrateHitboxVFXToUnifiedEntries()
+{
+	if (GEditor && GEditor->PlayWorld)
+	{
+		return TEXT("Refused: stop PIE/SIE before migrating hitbox VFX.");
+	}
+
+	static const TCHAR* MontagePaths[] = {
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A1.AM_Ground_A1"),
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A2.AM_Ground_A2"),
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A3.AM_Ground_A3"),
+		TEXT("/Game/Game/Combat/Montages/AM_Ground_A4.AM_Ground_A4"),
+		TEXT("/Game/Game/Combat/Montages/AM_Launcher_L2.AM_Launcher_L2"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S4.AM_Skill_S4"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S5.AM_Skill_S5"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S6.AM_Skill_S6"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S7.AM_Skill_S7"),
+		TEXT("/Game/Game/Combat/Montages/AM_Dive_D3.AM_Dive_D3")
+	};
+
+	int32 MigratedHitboxes = 0;
+	int32 ModifiedMontages = 0;
+	int32 RemovedLegacySlots = 0;
+	FString Missing;
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	SaveArgs.Error = GError;
+
+	auto AppendUniqueEffect = [](TArray<FConfirmedHitVFXEntry>& Entries, UFXSystemAsset* Effect, float Scale)
+	{
+		if (!Effect)
+		{
+			return false;
+		}
+		for (const FConfirmedHitVFXEntry& Existing : Entries)
+		{
+			if (Existing.Effect.Get() == Effect)
+			{
+				return false;
+			}
+		}
+		FConfirmedHitVFXEntry& NewEntry = Entries.AddDefaulted_GetRef();
+		NewEntry.Effect = Effect;
+		NewEntry.Scale = FVector(FMath::Max(0.01f, Scale));
+		NewEntry.bAlignToHitNormal = true;
+		return true;
+	};
+
+	for (const TCHAR* Path : MontagePaths)
+	{
+		UAnimMontage* Montage = LoadObject<UAnimMontage>(nullptr, Path);
+		if (!Montage)
+		{
+			if (!Missing.IsEmpty())
+			{
+				Missing += TEXT(", ");
+			}
+			Missing += Path;
+			continue;
+		}
+
+		bool bMontageChanged = false;
+		for (FAnimNotifyEvent& Event : Montage->Notifies)
+		{
+			UANS_MeleeHitbox* Hitbox = Cast<UANS_MeleeHitbox>(Event.NotifyStateClass.Get());
+			if (!Hitbox)
+			{
+				continue;
+			}
+
+			const float LegacyScale = FMath::Max(0.01f, Hitbox->ConfirmedHitVFXScale);
+			TArray<FConfirmedHitVFXEntry> Entries = Hitbox->ConfirmedHitVFXEntries;
+			for (FConfirmedHitVFXEntry& Entry : Entries)
+			{
+				Entry.Scale.X = FMath::Max(0.01f, Entry.Scale.X * LegacyScale);
+				Entry.Scale.Y = FMath::Max(0.01f, Entry.Scale.Y * LegacyScale);
+				Entry.Scale.Z = FMath::Max(0.01f, Entry.Scale.Z * LegacyScale);
+			}
+
+			for (const TObjectPtr<UNiagaraSystem>& Effect : Hitbox->ConfirmedHitVFXList)
+			{
+				if (AppendUniqueEffect(Entries, Effect.Get(), LegacyScale))
+				{
+					++RemovedLegacySlots;
+				}
+			}
+			for (const TObjectPtr<UParticleSystem>& Effect : Hitbox->ConfirmedHitParticleVFXList)
+			{
+				if (AppendUniqueEffect(Entries, Effect.Get(), LegacyScale))
+				{
+					++RemovedLegacySlots;
+				}
+			}
+			if (AppendUniqueEffect(Entries, Hitbox->ConfirmedHitVFX, LegacyScale))
+			{
+				++RemovedLegacySlots;
+			}
+			if (AppendUniqueEffect(Entries, Hitbox->ConfirmedHitParticleVFX, LegacyScale))
+			{
+				++RemovedLegacySlots;
+			}
+
+			Entries.RemoveAll([](const FConfirmedHitVFXEntry& Entry)
+			{
+				return Entry.Effect == nullptr;
+			});
+
+			const int32 LegacyCount = Hitbox->ConfirmedHitVFXList.Num()
+				+ Hitbox->ConfirmedHitParticleVFXList.Num()
+				+ (Hitbox->ConfirmedHitVFX ? 1 : 0)
+				+ (Hitbox->ConfirmedHitParticleVFX ? 1 : 0);
+			const bool bHadLegacyData = LegacyCount > 0 || !FMath::IsNearlyEqual(LegacyScale, 1.f);
+			if (bHadLegacyData || Entries.Num() != Hitbox->ConfirmedHitVFXEntries.Num())
+			{
+				Hitbox->Modify();
+				Hitbox->ConfirmedHitVFXEntries = MoveTemp(Entries);
+				Hitbox->ConfirmedHitVFXList.Reset();
+				Hitbox->ConfirmedHitParticleVFXList.Reset();
+				Hitbox->ConfirmedHitVFX = nullptr;
+				Hitbox->ConfirmedHitParticleVFX = nullptr;
+				Hitbox->ConfirmedHitVFXScale = 1.f;
+				bMontageChanged = true;
+				++MigratedHitboxes;
+			}
+		}
+
+		if (!bMontageChanged)
+		{
+			continue;
+		}
+
+		Montage->Modify();
+		Montage->MarkPackageDirty();
+		UPackage* Package = Montage->GetOutermost();
+		FString PackageFileName;
+		if (!Package || !FPackageName::TryConvertLongPackageNameToFilename(
+			Package->GetName(), PackageFileName, FPackageName::GetAssetPackageExtension()) ||
+			!UPackage::SavePackage(Package, Montage, *PackageFileName, SaveArgs))
+		{
+			return FString::Printf(TEXT("Migrated in memory, but saving %s failed."), Path);
+		}
+		++ModifiedMontages;
+	}
+
+	FString Result = FString::Printf(
+		TEXT("Unified confirmed-hit VFX on %d hitboxes across %d montages; migrated %d legacy slots."),
+		MigratedHitboxes, ModifiedMontages, RemovedLegacySlots);
 	if (!Missing.IsEmpty())
 	{
 		Result += FString::Printf(TEXT(" Missing: %s"), *Missing);
@@ -919,13 +1141,15 @@ FString UEnemyBlueprintAutomationLibrary::ConfigureEnemyAttackTelegraph()
 
 FString UEnemyBlueprintAutomationLibrary::ConfigureCombatVFXAndFinisher()
 {
-	UNiagaraSystem* ConfirmedHitVFX = LoadObject<UNiagaraSystem>(nullptr,
-		TEXT("/Game/Vefects/Easy_Impact_Frames/VFX/Frames/Particles/Tests/NS_Impact_Frame_01.NS_Impact_Frame_01"));
-	UNiagaraSystem* ActionVFX = LoadObject<UNiagaraSystem>(nullptr,
+	UParticleSystem* RegularImpactVFX = LoadObject<UParticleSystem>(nullptr,
+		TEXT("/Game/StarterContent/Particles/P_Sparks.P_Sparks"));
+	UParticleSystem* FinisherImpactVFX = LoadObject<UParticleSystem>(nullptr,
+		TEXT("/Game/StarterContent/Particles/P_Explosion.P_Explosion"));
+	UNiagaraSystem* LegacyActionVFX = LoadObject<UNiagaraSystem>(nullptr,
 		TEXT("/Game/Vefects/Easy_Impact_Frames/VFX/Frames/Particles/Tests/NS_Impact_Frame_01_Always.NS_Impact_Frame_01_Always"));
-	if (!ConfirmedHitVFX || !ActionVFX)
+	if (!RegularImpactVFX || !FinisherImpactVFX)
 	{
-		return TEXT("Refused: Easy_Impact_Frames candidate Niagara systems could not be loaded.");
+		return TEXT("Refused: StarterContent impact particle systems could not be loaded.");
 	}
 
 	static const TCHAR* MontagePaths[] = {
@@ -943,7 +1167,8 @@ FString UEnemyBlueprintAutomationLibrary::ConfigureCombatVFXAndFinisher()
 
 	int32 ModifiedMontages = 0;
 	int32 ModifiedHitboxes = 0;
-	int32 AddedActionNotifies = 0;
+	int32 AddedStartNotifies = 0;
+	int32 RemovedActionNotifies = 0;
 	FString Missing;
 	FSavePackageArgs SaveArgs;
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
@@ -963,7 +1188,6 @@ FString UEnemyBlueprintAutomationLibrary::ConfigureCombatVFXAndFinisher()
 		}
 
 		const bool bIsFinisher = FString(Path).EndsWith(TEXT("AM_Skill_S7.AM_Skill_S7"));
-		float FirstHitTime = -1.f;
 		bool bChanged = false;
 		for (FAnimNotifyEvent& Event : Montage->Notifies)
 		{
@@ -973,72 +1197,107 @@ FString UEnemyBlueprintAutomationLibrary::ConfigureCombatVFXAndFinisher()
 				continue;
 			}
 
-			FirstHitTime = FirstHitTime < 0.f ? Event.GetTriggerTime() : FMath::Min(FirstHitTime, Event.GetTriggerTime());
 			Hitbox->Modify();
-			Hitbox->ConfirmedHitVFX = ConfirmedHitVFX;
-			Hitbox->ConfirmedHitVFXScale = bIsFinisher ? 1.15f : 0.9f;
-			Hitbox->bStartFinisherCinematic = bIsFinisher;
-			Hitbox->FinisherVFX = bIsFinisher ? ActionVFX : nullptr;
+			// The Easy Impact Frames test systems use a screen-space translucent
+			// material that corrupts the environment when instances accumulate.
+			// Use the engine sample particle as the visible, auto-destroying placeholder.
+			Hitbox->ConfirmedHitVFXList.Reset();
+			Hitbox->ConfirmedHitParticleVFXList.Reset();
+			Hitbox->ConfirmedHitVFXEntries.Reset();
+			Hitbox->ConfirmedHitVFX = nullptr;
+			Hitbox->ConfirmedHitParticleVFX = nullptr;
+			FConfirmedHitVFXEntry& ImpactEntry = Hitbox->ConfirmedHitVFXEntries.AddDefaulted_GetRef();
+			ImpactEntry.Effect = bIsFinisher ? FinisherImpactVFX : RegularImpactVFX;
+			ImpactEntry.Scale = FVector(bIsFinisher ? 0.45f : 0.65f);
+			ImpactEntry.bAlignToHitNormal = true;
+			Hitbox->ConfirmedHitVFXScale = 1.f;
 			bChanged = true;
 			++ModifiedHitboxes;
 		}
 
 		if (bIsFinisher)
 		{
-			UAnimNotify_PlayNiagaraEffect* ActionNotify = nullptr;
-			FAnimNotifyEvent* ExistingEvent = nullptr;
+			const int32 Removed = Montage->Notifies.RemoveAll(
+				[LegacyActionVFX](const FAnimNotifyEvent& Event)
+				{
+					if (Event.NotifyName == FName(TEXT("FinisherActionVFX")))
+					{
+						return true;
+					}
+					const UAnimNotify_PlayNiagaraEffect* Candidate = Cast<UAnimNotify_PlayNiagaraEffect>(Event.Notify);
+					return Candidate && LegacyActionVFX && Candidate->Template == LegacyActionVFX;
+				});
+			if (Removed > 0)
+			{
+				RemovedActionNotifies += Removed;
+				bChanged = true;
+			}
+
+			const int32 RemovedLegacyStart = Montage->Notifies.RemoveAll(
+				[](const FAnimNotifyEvent& Event)
+				{
+					return Event.NotifyName == FName(TEXT("FinisherCinematicStart"));
+				});
+			if (RemovedLegacyStart > 0)
+			{
+				RemovedActionNotifies += RemovedLegacyStart;
+				bChanged = true;
+			}
+
+			UANS_FinisherCinematic* CinematicState = nullptr;
+			FAnimNotifyEvent* ExistingCinematicEvent = nullptr;
 			for (FAnimNotifyEvent& Event : Montage->Notifies)
 			{
-				if (UAnimNotify_PlayNiagaraEffect* Candidate = Cast<UAnimNotify_PlayNiagaraEffect>(Event.Notify))
+				if (UANS_FinisherCinematic* Candidate = Cast<UANS_FinisherCinematic>(Event.NotifyStateClass.Get()))
 				{
-					if (Candidate->Template == ActionVFX || Event.NotifyName == FName(TEXT("FinisherActionVFX")))
-					{
-						ActionNotify = Candidate;
-						ExistingEvent = &Event;
-						break;
-					}
+					CinematicState = Candidate;
+					ExistingCinematicEvent = &Event;
+					break;
 				}
 			}
 
-			if (!ActionNotify)
+			if (!CinematicState)
 			{
-				ActionNotify = NewObject<UAnimNotify_PlayNiagaraEffect>(
-					Montage, UAnimNotify_PlayNiagaraEffect::StaticClass(), NAME_None, RF_Transactional);
+				CinematicState = NewObject<UANS_FinisherCinematic>(
+					Montage, UANS_FinisherCinematic::StaticClass(), NAME_None, RF_Transactional);
 			}
-			if (ActionNotify)
+			if (CinematicState)
 			{
-				ActionNotify->Modify();
-				ActionNotify->Template = ActionVFX;
-				ActionNotify->Attached = false;
-				ActionNotify->SocketName = TEXT("pelvis");
-				ActionNotify->LocationOffset = FVector(0.f, 0.f, -85.f);
-				ActionNotify->RotationOffset = FRotator::ZeroRotator;
-				ActionNotify->Scale = FVector(1.2f);
-
-				if (!ExistingEvent)
+				constexpr float FinisherStartTime = 0.02f;
+				constexpr float FinisherWindowDuration = 0.68f;
+				bool bAddedCinematicEvent = false;
+				if (!ExistingCinematicEvent)
 				{
 					FAnimNotifyEvent& Event = Montage->Notifies.AddDefaulted_GetRef();
-					ExistingEvent = &Event;
-					++AddedActionNotifies;
+					ExistingCinematicEvent = &Event;
+					bAddedCinematicEvent = true;
+					++AddedStartNotifies;
 				}
 
-				const float TriggerTime = FirstHitTime >= 0.f
-					? FirstHitTime
-					: FMath::Min(0.2f, Montage->GetPlayLength());
-				ExistingEvent->NotifyName = FName(TEXT("FinisherActionVFX"));
-				ExistingEvent->Link(Montage, TriggerTime, 0);
-				ExistingEvent->TriggerTimeOffset = 0.f;
-				ExistingEvent->EndTriggerTimeOffset = 0.f;
-				ExistingEvent->TrackIndex = 2;
-				ExistingEvent->Notify = ActionNotify;
-				ExistingEvent->NotifyStateClass = nullptr;
-				ExistingEvent->MontageTickType = EMontageNotifyTickType::Queued;
-				ExistingEvent->NotifyTriggerChance = 1.f;
-#if WITH_EDITORONLY_DATA
-				ExistingEvent->DisplayTime_DEPRECATED = TriggerTime;
-				if (!ExistingEvent->Guid.IsValid())
+				CinematicState->Modify();
+				ExistingCinematicEvent->NotifyName = FName(TEXT("FinisherCinematicWindow"));
+				ExistingCinematicEvent->TriggerTimeOffset = 0.f;
+				ExistingCinematicEvent->EndTriggerTimeOffset = 0.f;
+				ExistingCinematicEvent->TrackIndex = 2;
+				ExistingCinematicEvent->Notify = nullptr;
+				ExistingCinematicEvent->NotifyStateClass = CinematicState;
+				if (bAddedCinematicEvent)
 				{
-					ExistingEvent->Guid = FGuid::NewGuid();
+					ExistingCinematicEvent->Link(Montage, FinisherStartTime, 0);
+					ExistingCinematicEvent->SetDuration(
+						FMath::Min(FinisherWindowDuration, FMath::Max(0.f, Montage->GetPlayLength() - FinisherStartTime)));
+					ExistingCinematicEvent->EndLink.Link(Montage, ExistingCinematicEvent->EndLink.GetTime(), 0);
+				}
+				ExistingCinematicEvent->MontageTickType = EMontageNotifyTickType::Queued;
+				ExistingCinematicEvent->NotifyTriggerChance = 1.f;
+#if WITH_EDITORONLY_DATA
+				if (bAddedCinematicEvent)
+				{
+					ExistingCinematicEvent->DisplayTime_DEPRECATED = FinisherStartTime;
+				}
+				if (!ExistingCinematicEvent->Guid.IsValid())
+				{
+					ExistingCinematicEvent->Guid = FGuid::NewGuid();
 				}
 #endif
 				bChanged = true;
@@ -1068,11 +1327,229 @@ FString UEnemyBlueprintAutomationLibrary::ConfigureCombatVFXAndFinisher()
 	}
 
 	FString Result = FString::Printf(
-		TEXT("Applied: confirmed-hit VFX on %d hitboxes across %d montages; S7 action notify added=%d."),
-		ModifiedHitboxes, ModifiedMontages, AddedActionNotifies);
+		TEXT("Applied: safe confirmed-hit particle lists on %d hitboxes across %d montages; S7 cinematic window added=%d, legacy action/start notifies removed=%d."),
+		ModifiedHitboxes, ModifiedMontages, AddedStartNotifies, RemovedActionNotifies);
 	if (!Missing.IsEmpty())
 	{
 		Result += FString::Printf(TEXT(" Missing: %s"), *Missing);
 	}
 	return Result;
+}
+
+FString UEnemyBlueprintAutomationLibrary::ConfigureEComboElectricTrailSample()
+{
+	if (GEditor && GEditor->PlayWorld)
+	{
+		return TEXT("Refused: stop PIE/SIE before configuring the E combo trail.");
+	}
+
+	UNiagaraSystem* SourceSystem = LoadObject<UNiagaraSystem>(nullptr,
+		TEXT("/Game/SwordTrailVFX/VFX/NS_Trail_10.NS_Trail_10"));
+	UNiagaraSystem* DonorSystem = LoadObject<UNiagaraSystem>(nullptr,
+		TEXT("/Game/SwordTrailVFX/VFX/NS_Trail_15.NS_Trail_15"));
+	UMaterialInterface* SourceMainMaterial = LoadObject<UMaterialInterface>(nullptr,
+		TEXT("/Game/SwordTrailVFX/Materials/Trails_MI/MI_Trail_Color_08.MI_Trail_Color_08"));
+	UMaterialInterface* ElectricMaterial = LoadObject<UMaterialInterface>(nullptr,
+		TEXT("/Game/SwordTrailVFX/Materials/Trails_MI/MI_Trail_Color_17.MI_Trail_Color_17"));
+	if (!SourceSystem || !DonorSystem || !SourceMainMaterial || !ElectricMaterial)
+	{
+		return TEXT("Refused: NS_Trail_10, NS_Trail_15, MI_Trail_Color_08, or MI_Trail_Color_17 is missing.");
+	}
+
+	auto CountRibbonMaterial = [](UNiagaraSystem* System, UMaterialInterface* Material)
+	{
+		int32 Count = 0;
+		for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+		{
+			const FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData();
+			if (!EmitterData)
+			{
+				continue;
+			}
+			for (const UNiagaraRendererProperties* Renderer : EmitterData->GetRenderers())
+			{
+				const UNiagaraRibbonRendererProperties* Ribbon = Cast<UNiagaraRibbonRendererProperties>(Renderer);
+				Count += Ribbon && Ribbon->Material == Material ? 1 : 0;
+			}
+		}
+		return Count;
+	};
+
+	const int32 SourceRendererCount = CountRibbonMaterial(SourceSystem, SourceMainMaterial);
+	const int32 DonorRendererCount = CountRibbonMaterial(DonorSystem, ElectricMaterial);
+	if (SourceRendererCount <= 0 || DonorRendererCount <= 0)
+	{
+		return FString::Printf(
+			TEXT("Refused: renderer contract changed (NS10 main=%d, NS15 electric=%d)."),
+			SourceRendererCount, DonorRendererCount);
+	}
+
+	static const FString TargetAssetName(TEXT("NS_ECombo_ElectricTrail"));
+	static const FString TargetPackagePath(TEXT("/Game/Game/Combat/VFX/Trails"));
+	static const FString TargetObjectPath = TargetPackagePath / TargetAssetName + TEXT(".") + TargetAssetName;
+	UNiagaraSystem* TargetSystem = LoadObject<UNiagaraSystem>(nullptr, *TargetObjectPath);
+	bool bCreatedSystem = false;
+	if (!TargetSystem)
+	{
+		TargetSystem = Cast<UNiagaraSystem>(
+			FAssetToolsModule::GetModule().Get().DuplicateAsset(TargetAssetName, TargetPackagePath, SourceSystem));
+		bCreatedSystem = TargetSystem != nullptr;
+	}
+	if (!TargetSystem)
+	{
+		return TEXT("Refused: could not duplicate NS_Trail_10 into the project Combat/VFX folder.");
+	}
+
+	TArray<UNiagaraRibbonRendererProperties*> RibbonsToReplace;
+	int32 ExistingElectricRenderers = 0;
+	for (FNiagaraEmitterHandle& Handle : TargetSystem->GetEmitterHandles())
+	{
+		FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData();
+		if (!EmitterData)
+		{
+			continue;
+		}
+		for (UNiagaraRendererProperties* Renderer : EmitterData->GetRenderers())
+		{
+			UNiagaraRibbonRendererProperties* Ribbon = Cast<UNiagaraRibbonRendererProperties>(Renderer);
+			if (!Ribbon)
+			{
+				continue;
+			}
+			if (Ribbon->Material == SourceMainMaterial)
+			{
+				if (Ribbon->GetOutermost() != TargetSystem->GetOutermost())
+				{
+					return TEXT("Refused: duplicated renderer is not owned by the target package; vendor asset was not modified.");
+				}
+				RibbonsToReplace.Add(Ribbon);
+			}
+			else if (Ribbon->Material == ElectricMaterial)
+			{
+				++ExistingElectricRenderers;
+			}
+		}
+	}
+	if (RibbonsToReplace.IsEmpty() && ExistingElectricRenderers <= 0)
+	{
+		return TEXT("Refused: target asset exists but does not match the expected NS_Trail_10 renderer layout.");
+	}
+
+	TargetSystem->Modify();
+	FProperty* MaterialProperty = FindFProperty<FProperty>(
+		UNiagaraRibbonRendererProperties::StaticClass(),
+		GET_MEMBER_NAME_CHECKED(UNiagaraRibbonRendererProperties, Material));
+	for (UNiagaraRibbonRendererProperties* Ribbon : RibbonsToReplace)
+	{
+		Ribbon->Modify();
+		Ribbon->Material = ElectricMaterial;
+		FPropertyChangedEvent MaterialChangedEvent(MaterialProperty);
+		Ribbon->PostEditChangeProperty(MaterialChangedEvent);
+	}
+	TargetSystem->bFixedBounds = true;
+	TargetSystem->SetFixedBounds(FBox(FVector(-300.f), FVector(300.f)));
+	TargetSystem->PostEditChange();
+	if (TargetSystem->HasOutstandingCompilationRequests(true))
+	{
+		TargetSystem->WaitForCompilationComplete(true, true);
+	}
+	TargetSystem->MarkPackageDirty();
+
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	SaveArgs.Error = GError;
+	UPackage* TargetPackage = TargetSystem->GetOutermost();
+	FString TargetPackageFileName;
+	if (!TargetPackage || !FPackageName::TryConvertLongPackageNameToFilename(
+		TargetPackage->GetName(), TargetPackageFileName, FPackageName::GetAssetPackageExtension()) ||
+		!UPackage::SavePackage(TargetPackage, TargetSystem, *TargetPackageFileName, SaveArgs))
+	{
+		return TEXT("Applied the Niagara hybrid in memory, but saving NS_ECombo_ElectricTrail failed.");
+	}
+
+	static const TCHAR* MontagePaths[] = {
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S4.AM_Skill_S4"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S5.AM_Skill_S5"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S6.AM_Skill_S6"),
+		TEXT("/Game/Game/Combat/Montages/AM_Skill_S7.AM_Skill_S7")
+	};
+	static const FName TrailNotifyName(TEXT("EComboElectricTrail"));
+	static const FName TrailTrackName(TEXT("E Trail"));
+	int32 ModifiedMontages = 0;
+	for (const TCHAR* MontagePath : MontagePaths)
+	{
+		UAnimMontage* Montage = LoadObject<UAnimMontage>(nullptr, MontagePath);
+		if (!Montage)
+		{
+			return FString::Printf(TEXT("Applied Niagara hybrid, but montage is missing: %s"), MontagePath);
+		}
+
+		Montage->Modify();
+		Montage->Notifies.RemoveAll([](const FAnimNotifyEvent& Event)
+		{
+			return Event.NotifyName == TrailNotifyName;
+		});
+
+		int32 TrailTrackIndex = Montage->AnimNotifyTracks.IndexOfByPredicate([](const FAnimNotifyTrack& Track)
+		{
+			return Track.TrackName == TrailTrackName;
+		});
+		if (TrailTrackIndex == INDEX_NONE)
+		{
+			TrailTrackIndex = Montage->AnimNotifyTracks.Add(
+				FAnimNotifyTrack(TrailTrackName, FLinearColor(0.1f, 0.65f, 1.f, 1.f)));
+		}
+
+		UANS_TimedNiagaraEffect* TrailState = NewObject<UANS_TimedNiagaraEffect>(
+			Montage, UANS_TimedNiagaraEffect::StaticClass(), NAME_None, RF_Transactional);
+		if (!TrailState)
+		{
+			return FString::Printf(TEXT("Applied Niagara hybrid, but could not create trail state for %s."), MontagePath);
+		}
+		TrailState->Template = TargetSystem;
+		TrailState->SocketName = TEXT("hand_r");
+		TrailState->LocationOffset = FVector::ZeroVector;
+		TrailState->RotationOffset = FRotator::ZeroRotator;
+		TrailState->Scale = FVector::OneVector;
+		TrailState->bApplyRateScaleAsTimeDilation = true;
+		TrailState->bDestroyAtEnd = false;
+
+		const float StartTime = FMath::Min(0.01f, Montage->GetPlayLength() * 0.1f);
+		const float Duration = FMath::Max(1.f / 60.f, Montage->GetPlayLength() - StartTime - 0.01f);
+		FAnimNotifyEvent& Event = Montage->Notifies.AddDefaulted_GetRef();
+		Event.NotifyName = TrailNotifyName;
+		Event.Link(Montage, StartTime, 0);
+		Event.TriggerTimeOffset = GetTriggerTimeOffsetForType(Montage->CalculateOffsetForNotify(StartTime));
+		Event.EndTriggerTimeOffset = 0.f;
+		Event.TrackIndex = TrailTrackIndex;
+		Event.Notify = nullptr;
+		Event.NotifyStateClass = TrailState;
+		Event.SetDuration(Duration);
+		Event.EndLink.Link(Montage, Event.EndLink.GetTime(), 0);
+		Event.MontageTickType = EMontageNotifyTickType::Queued;
+		Event.NotifyTriggerChance = 1.f;
+#if WITH_EDITORONLY_DATA
+		Event.DisplayTime_DEPRECATED = StartTime;
+		Event.Guid = FGuid::NewGuid();
+#endif
+
+		Montage->SortNotifies();
+		Montage->InitializeNotifyTrack();
+		Montage->RefreshCacheData();
+		Montage->MarkPackageDirty();
+		UPackage* MontagePackage = Montage->GetOutermost();
+		FString MontagePackageFileName;
+		if (!MontagePackage || !FPackageName::TryConvertLongPackageNameToFilename(
+			MontagePackage->GetName(), MontagePackageFileName, FPackageName::GetAssetPackageExtension()) ||
+			!UPackage::SavePackage(MontagePackage, Montage, *MontagePackageFileName, SaveArgs))
+		{
+			return FString::Printf(TEXT("Configured trail in memory, but saving failed: %s"), MontagePath);
+		}
+		++ModifiedMontages;
+	}
+
+	return FString::Printf(
+		TEXT("Applied: %s NS_Trail_10 hybrid, replaced %d main ribbon renderer(s) with NS_Trail_15 electric material; hand_r Timed Niagara spans %d E montages."),
+		bCreatedSystem ? TEXT("created") : TEXT("updated"),
+		RibbonsToReplace.Num(), ModifiedMontages);
 }
